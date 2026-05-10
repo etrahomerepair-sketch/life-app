@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm create *)",
+      "Bash(which node *)",
+      "Read(//Users/ravinanderson/.nvm/**)",
+      "Read(//Users/ravinanderson/.local/**)",
+      "Bash(find /Users/ravinanderson -name \"node\" -type f 2>/dev/null | head -5; find /usr -name \"node\" -type f 2>/dev/null | head -5)"
+    ]
+  }
+}
