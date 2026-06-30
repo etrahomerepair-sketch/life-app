@@ -8,6 +8,11 @@ import type { ChatMessage } from '../types'
 
 const STORAGE_KEY = 'life_app_chat'
 
+const AI = {
+  useMimo: true,
+  mimoProxyUrl: '/.netlify/functions/mimo',
+}
+
 const starterPrompts = [
   'What should I focus on improving this week?',
   'Analyze my mood and energy patterns',
@@ -99,20 +104,32 @@ Give specific, direct advice. Reference their actual data. Don't be generic. Be 
     setLoading(true)
 
     try {
-      const res = await fetch('/.netlify/functions/ai-coach', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          messages: newMessages.map(m => ({ role: m.role, content: m.content })),
-          systemContext: context,
-        }),
-      })
+      const res = AI.useMimo
+        ? await fetch(AI.mimoProxyUrl, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              system: context,
+              input: newMessages.map(m => ({ role: m.role, content: m.content })),
+            }),
+          })
+        : await fetch('/.netlify/functions/ai-coach', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              messages: newMessages.map(m => ({ role: m.role, content: m.content })),
+              systemContext: context,
+            }),
+          })
       const data = await res.json()
-      if (data.message) {
-        setMessages([...newMessages, { role: 'assistant', content: data.message }])
+      const reply = AI.useMimo ? data.text : data.message
+      if (reply) {
+        setMessages([...newMessages, { role: 'assistant', content: reply }])
+      } else {
+        setMessages([...newMessages, { role: 'assistant', content: 'Sorry, I had trouble connecting to the AI coach.' }])
       }
     } catch (err) {
-      setMessages([...newMessages, { role: 'assistant', content: 'Sorry, I had trouble connecting. Make sure the ANTHROPIC_API_KEY is set in your Netlify environment variables.' }])
+      setMessages([...newMessages, { role: 'assistant', content: 'Sorry, I had trouble connecting to the AI coach. Please check the Netlify MiMo function environment variables.' }])
     }
     setLoading(false)
   }
