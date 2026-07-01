@@ -49,8 +49,10 @@ const MIMO_SYSTEM_PROMPT =
 `You are the LEDGER SCRIBE for an app called Life Ledger — a real-life tracker styled as an RPG.
 You receive a player's profile (background/class, physical stats, self-reported vices, and their
 own stated short-term and long-term goals) and their CURRENT state for today: structured fields
-(workouts, drinks, sleep, meals, mood, money) plus an optional free-text note. You are called after
+(workouts, drinks, sleep, meals, mood, money, and "viceLog" — their self-reported clean/slip
+check-in for each vice they track) plus an optional free-text note. You are called after
 EVERY logged change, including quick one-tap logs with no note attached — not just journal entries.
+A clean day on a vice is a win worth acknowledging; a slip is coaching material, never shaming.
 This is a real person trying to actually improve their real life — take the job seriously. Read
 carefully and act like an active coach who's paying attention across the whole day, not a form
 validator, and who remembers what this specific person is trying to achieve.
@@ -145,6 +147,48 @@ function normalizeUnits(f) {
   if (f.units === "imperial") return { ...f, heightCm: ftInToCm(f.heightFt, f.heightIn), weightKg: lbToKg(f.weightLb) };
   const { ft, inch } = cmToFtIn(f.heightCm);
   return { ...f, heightFt: ft, heightIn: inch, weightLb: kgToLb(f.weightKg) };
+}
+
+/* --------------------- vices, XP, daily page ----------------------- */
+// Kebab tag for each vice so daily slips feed the same tag system the
+// AI uses — which is what avoid_tag quests are scored against.
+const VICE_TAGS = {
+  "Cigarettes": "smoking", "Vaping / e-cigarettes": "vaping", "Weed / cannabis": "weed",
+  "Alcohol": "alcohol", "Gambling": "gambling", "Junk food": "junk-food",
+  "Energy drinks / heavy caffeine": "caffeine",
+};
+const viceTag = (name) => VICE_TAGS[name] || String(name).toLowerCase().trim().replace(/[^a-z0-9]+/g, "-");
+const viceShort = (name) => ({ "Vaping / e-cigarettes": "Vaping", "Weed / cannabis": "Weed", "Energy drinks / heavy caffeine": "Caffeine" })[name] || name;
+
+// Deterministic XP for a day's entry — the per-tap reward that makes
+// logging feel like it pays out. Numbers are small on purpose; the
+// total is what compounds.
+function xpForEntry(e, viceNames = []) {
+  if (!e) return 0;
+  let xp = 0;
+  const meals = e.meals || {};
+  xp += ["breakfast", "lunch", "dinner"].filter((m) => meals[m]).length * 5;
+  if (Number(e.sleep) > 0) xp += 10;
+  xp += Math.min(Number(e.workouts) || 0, 3) * 15;
+  if ((Number(e.earned) || 0) > 0 || (Number(e.spent) || 0) > 0) xp += 5;
+  if (e.notes) xp += 15;
+  const vl = e.viceLog || {};
+  viceNames.forEach((v) => { if (vl[v] && vl[v].clean && !(vl[v].slips > 0)) xp += 10; });
+  return xp;
+}
+
+// What's left to seal today's page. Closing every item is the daily loop.
+function dailyChecklist(e, viceNames = []) {
+  const meals = e?.meals || {};
+  const items = [
+    { key: "breakfast", label: "Breakfast", done: !!meals.breakfast },
+    { key: "lunch", label: "Lunch", done: !!meals.lunch },
+    { key: "dinner", label: "Dinner", done: !!meals.dinner },
+    { key: "sleep", label: "Sleep", done: Number(e?.sleep) > 0 },
+  ];
+  if (viceNames.length) items.push({ key: "vices", label: "Vice check", done: viceNames.every((v) => e?.viceLog?.[v]) });
+  items.push({ key: "journal", label: "Journal", done: !!e?.notes });
+  return items;
 }
 
 function dietFromMeals(meals) {
@@ -419,7 +463,7 @@ export default function App() {
 
   const todayStr = () => new Date().toISOString().slice(0, 10);
   const todayEntry = entries.find((e) => e.date === todayStr() && e.period === "day") || null;
-  const blankToday = () => ({ id: Date.now(), date: todayStr(), period: "day", workouts: 0, drinks: 0, sleep: 0, meals: {}, diet: 0, mood: 0, earned: 0, spent: 0, gambleWon: 0, gambleLost: 0, tags: [], ai: { ok: false }, notes: "" });
+  const blankToday = () => ({ id: Date.now(), date: todayStr(), period: "day", workouts: 0, drinks: 0, sleep: 0, meals: {}, diet: 0, mood: 0, earned: 0, spent: 0, gambleWon: 0, gambleLost: 0, viceLog: {}, tags: [], ai: { ok: false }, notes: "" });
 
   // Refs mirroring the latest state so the debounced Scribe call below always
   // reads fresh data, even though it fires ~1s after the render that queued it.
@@ -442,7 +486,7 @@ export default function App() {
     };
     let result = null, aiOffline = null;
     try {
-      result = await processEntry(profile, { date: snapshot.date, period: snapshot.period, workouts: snapshot.workouts, drinks: snapshot.drinks, sleep: snapshot.sleep, meals: snapshot.meals, dietScore: snapshot.diet, mood: snapshot.mood, earned: num(snapshot.earned), spent: num(snapshot.spent), note: note || "" }, ctx);
+      result = await processEntry(profile, { date: snapshot.date, period: snapshot.period, workouts: snapshot.workouts, drinks: snapshot.drinks, sleep: snapshot.sleep, meals: snapshot.meals, dietScore: snapshot.diet, mood: snapshot.mood, earned: num(snapshot.earned), spent: num(snapshot.spent), viceLog: snapshot.viceLog || {}, note: note || "" }, ctx);
     } catch (err) {
       // Toast headers already say "offline"/"saved without AI" — keep this to
       // the raw detail so it doesn't repeat itself (e.g. "Scribe offline" /
@@ -507,6 +551,16 @@ export default function App() {
       const updated = { ...base, ...patch };
       if (patch.meals) updated.meals = { ...(base.meals || {}), ...patch.meals };
       if (updated.meals && Object.keys(updated.meals).length) updated.diet = dietFromMeals(updated.meals);
+      if (patch.viceLog) {
+        updated.viceLog = { ...(base.viceLog || {}), ...patch.viceLog };
+        // The day's clean/slip state is authoritative for vice tags: strip all
+        // vice tags, then re-add ones with slips, so avoid_tag quest streaks
+        // track what you actually reported today.
+        const viceTagSet = new Set((profile.vices || []).map(viceTag));
+        const kept = (updated.tags || []).filter((t) => !viceTagSet.has(t));
+        const slipped = (profile.vices || []).filter((v) => updated.viceLog[v]?.slips > 0).map(viceTag);
+        updated.tags = Array.from(new Set([...kept, ...slipped]));
+      }
       const next = existing ? prev.map((e) => (e.id === existing.id ? updated : e)) : [updated, ...prev].sort((a, b) => new Date(b.date) - new Date(a.date));
       storeSet(KEY_E, next);
       return next;
@@ -532,7 +586,8 @@ export default function App() {
     const attrs = computeAttributes(profile, hab, gold, savingsRate, deeds, streak);
     const rank = rankFor(deeds);
     const quests = computeQuests({ entries, gold, startGold, streak, hab, deeds }, dynQuests);
-    return { hab, gold, startGold, savingsRate, deeds, streak, forecast, potential, attrs, rank, quests, gambleNet: gWon - gLost };
+    const totalXP = entries.reduce((s, e) => s + xpForEntry(e, profile.vices || []), 0);
+    return { hab, gold, startGold, savingsRate, deeds, streak, forecast, potential, attrs, rank, quests, gambleNet: gWon - gLost, totalXP };
   }, [profile, entries, dynQuests]);
 
   return (
@@ -545,8 +600,8 @@ export default function App() {
             : !unlocked ? <PinLock expected={pinHash} onUnlock={() => setUnlocked(true)} />
             : loading ? <div style={S.loading}>Unrolling the ledger…</div>
             : !profile || editing ? <Onboard initial={profile} onSave={saveProfile} onCancel={profile ? () => setEditing(false) : null} />
-            : tab === "hero" ? <Hero profile={profile} d={d} lastAI={lastAI} clearAI={() => setLastAI(null)} onEdit={() => setEditing(true)} onReset={resetAll} onLock={lock} onChangePin={changePin} onCompleteQuest={completeQuest} aiStatus={aiStatus} />
-            : tab === "log" ? <QuickLog today={todayEntry} profile={profile} onQuickUpdate={quickUpdate} onJournal={submitJournal} lastAI={lastAI} clearAI={() => setLastAI(null)} />
+            : tab === "hero" ? <Hero profile={profile} d={d} today={todayEntry} lastAI={lastAI} clearAI={() => setLastAI(null)} onEdit={() => setEditing(true)} onReset={resetAll} onLock={lock} onChangePin={changePin} onCompleteQuest={completeQuest} onGoLog={() => setTab("log")} aiStatus={aiStatus} />
+            : tab === "log" ? <QuickLog today={todayEntry} profile={profile} d={d} onQuickUpdate={quickUpdate} onJournal={submitJournal} lastAI={lastAI} clearAI={() => setLastAI(null)} />
             : tab === "chronicle" ? <Chronicle entries={entries} d={d} onDelete={deleteEntry} />
             : <Oracle profile={profile} entries={entries} d={d} cached={oracle} onResult={saveOracle} activeQuestTitles={dynQuests.map((q) => q.title)} onAdopt={adoptQuest} />}
         </div>
@@ -640,21 +695,28 @@ function Nav({ tab, setTab }) {
   const items = [{ id: "hero", label: "Hero", icon: "♦" }, { id: "log", label: "Log", icon: "✚" }, { id: "chronicle", label: "Chronicle", icon: "❧" }, { id: "oracle", label: "Oracle", icon: "✶" }];
   return (
     <nav style={S.nav}>
-      {items.map((it) => (
-        <button key={it.id} className="navbtn" onClick={() => setTab(it.id)} style={{ ...S.navBtn, color: tab === it.id ? C.goldHi : C.dim }}>
-          <span style={{ ...S.navIcon, opacity: tab === it.id ? 1 : 0.7 }}>{it.icon}</span>
-          <span style={S.navLabel}>{it.label}</span>
-          {tab === it.id && <span style={S.navDot} />}
-        </button>
-      ))}
+      {items.map((it) => {
+        const on = tab === it.id;
+        return (
+          <button key={it.id} className="navbtn" onClick={() => setTab(it.id)} style={{ ...S.navBtn, color: on ? C.goldHi : C.dim }}>
+            <span style={{ ...S.navIconWrap, ...(on ? S.navIconWrapOn : {}) }}>
+              <span style={{ ...S.navIcon, opacity: on ? 1 : 0.65 }}>{it.icon}</span>
+            </span>
+            <span style={{ ...S.navLabel, letterSpacing: on ? 1.5 : 1 }}>{it.label}</span>
+          </button>
+        );
+      })}
     </nav>
   );
 }
 
 /* ------------------------------- Hero ------------------------------ */
-function Hero({ profile, d, lastAI, clearAI, onEdit, onReset, onLock, onChangePin, onCompleteQuest, aiStatus }) {
-  const { forecast, potential, attrs, gold, rank, deeds, streak, savingsRate, quests } = d;
+function Hero({ profile, d, today, lastAI, clearAI, onEdit, onReset, onLock, onChangePin, onCompleteQuest, onGoLog, aiStatus }) {
+  const { forecast, potential, attrs, gold, rank, deeds, streak, savingsRate, quests, totalXP } = d;
   const [menu, setMenu] = useState(false);
+  const checklist = dailyChecklist(today, profile.vices || []);
+  const doneToday = checklist.filter((c) => c.done).length;
+  const sealed = doneToday === checklist.length;
   const lifeProgress = clamp(profile.age / forecast.estLifespan, 0, 1);
   const years = useCount(forecast.remainingYears), goldC = useCount(gold);
   const rankPct = rank.next ? clamp(((deeds - rank.current.at) / (rank.next.at - rank.current.at)) * 100, 0, 100) : 100;
@@ -702,12 +764,23 @@ function Hero({ profile, d, lastAI, clearAI, onEdit, onReset, onLock, onChangePi
             <Stat k="Forecast age" v={forecast.estLifespan} />
             <Stat k="Days remaining" v={forecast.remainingDays.toLocaleString()} />
             <Stat k="Potential left" v={`${potential} yrs`} accent />
+            <Stat k="Experience" v={`${totalXP.toLocaleString()} ✦`} />
           </div>
         </div>
         {forecast.mods.length > 0 ? (
           <div style={S.mods}>{forecast.mods.map((m) => <span key={m.label} className="chip" style={{ ...S.chip, color: m.value >= 0 ? C.sage : C.ember, borderColor: m.value >= 0 ? C.sage : C.ember }}>{m.label} {m.value >= 0 ? "+" : ""}{m.value}</span>)}</div>
         ) : <div style={S.dim}>Log a deed to start moving your forecast.</div>}
       </OrnateFrame>
+
+      <button className="pagebanner" style={{ ...S.pageBanner, ...(sealed ? S.pageBannerSealed : {}) }} onClick={onGoLog}>
+        <div style={S.pageBannerLeft}>
+          <span style={S.pageBannerTitle}>{sealed ? "✶ Today's page is sealed" : `Today's page · ${doneToday}/${checklist.length}`}</span>
+          <span style={S.pageBannerSub}>{sealed ? "All logged. Come back tomorrow to keep the streak." : "Tap to log " + checklist.filter((c) => !c.done).slice(0, 2).map((c) => c.label.toLowerCase()).join(", ") + (doneToday < checklist.length - 2 ? "…" : "")}</span>
+        </div>
+        <div style={S.pageSegsSmall}>
+          {checklist.map((c) => <span key={c.key} style={{ ...S.pageSeg, background: c.done ? C.goldHi : "transparent" }} />)}
+        </div>
+      </button>
 
       <Section title="Attributes">
         <div style={S.attrGrid}>{Object.entries(attrs).map(([k, v], i) => <AttrBar key={k} name={k} val={v} delay={i * 80} />)}</div>
@@ -1143,36 +1216,59 @@ function EditHero({ initial, onSave, onCancel }) {
 }
 
 /* ------------------------------ Log -------------------------------- */
+const SLEEP_PRESETS = [5, 6, 7, 8, 9];
+const MONEY_PRESETS = [10, 25, 50, 100];
+
 // Quick, one-tap logging for today, plus an optional free-text journal.
-// Each quick action saves instantly (no AI round trip needed — there's no
-// free text to interpret). The journal at the bottom is the only thing
-// that calls the Scribe, and it's entirely optional.
-function QuickLog({ today, profile, onQuickUpdate, onJournal, lastAI, clearAI }) {
+// Each quick action saves instantly and pays out a little XP on the spot;
+// the "Today's Page" card at the top shows what's still open so there's
+// always one more thing to close. The Scribe reads every change.
+function QuickLog({ today, profile, d, onQuickUpdate, onJournal, lastAI, clearAI }) {
   const t = today || {};
-  const [flashKey, setFlashKey] = useState(null);
+  const vices = profile.vices || [];
+  const checklist = dailyChecklist(t, vices);
+  const doneCount = checklist.filter((c) => c.done).length;
+  const sealed = doneCount === checklist.length;
+  const todayXP = xpForEntry(t, vices);
+
+  // flash = { key, xp } — drives the "✓ saved  +N ✦" payout on each card.
+  const [flash, setFlash] = useState(null);
   const flashTimer = useRef(null);
-  const flash = (key) => {
-    setFlashKey(key);
+  const pop = (key, xp = 0) => {
+    setFlash({ key, xp, at: Date.now() });
     clearTimeout(flashTimer.current);
-    flashTimer.current = setTimeout(() => setFlashKey(null), 1100);
+    flashTimer.current = setTimeout(() => setFlash(null), 1400);
   };
   useEffect(() => () => clearTimeout(flashTimer.current), []);
+  const flashFor = (keys) => (flash && keys.includes(flash.key) ? flash : null);
 
-  const setMeal = (meal, val) => { onQuickUpdate({ meals: { [meal]: val } }); flash(meal); };
-  const setSleep = (v) => { onQuickUpdate({ sleep: v }); flash("sleep"); };
-  const setWorkouts = (v) => { onQuickUpdate({ workouts: v }); flash("workouts"); };
-  const setDrinks = (v) => { onQuickUpdate({ drinks: v }); flash("drinks"); };
+  const setMeal = (meal, val) => { const first = !(t.meals || {})[meal]; onQuickUpdate({ meals: { [meal]: val } }); pop(meal, first ? 5 : 0); };
+  const setSleep = (v) => { const first = !(Number(t.sleep) > 0); onQuickUpdate({ sleep: v }); pop("sleep", first ? 10 : 0); };
+  const setWorkouts = (v) => { const gain = v > (Number(t.workouts) || 0) && v <= 3 ? 15 : 0; onQuickUpdate({ workouts: v }); pop("workouts", gain); };
+  const setDrinks = (v) => { onQuickUpdate({ drinks: v }); pop("drinks", 0); };
+
+  const setVice = (name, type) => {
+    const cur = (t.viceLog || {})[name] || { clean: false, slips: 0 };
+    if (type === "clean") {
+      onQuickUpdate({ viceLog: { [name]: { clean: true, slips: 0 } } });
+      pop("vice:" + name, cur.clean ? 0 : 10);
+    } else {
+      onQuickUpdate({ viceLog: { [name]: { clean: false, slips: (cur.slips || 0) + 1 } } });
+      pop("vice:" + name, 0);
+    }
+  };
 
   const [moneyAmt, setMoneyAmt] = useState("");
   const [moneyType, setMoneyType] = useState("spent");
-  const logMoney = () => {
-    const amt = Number(moneyAmt) || 0;
+  const addMoney = (amt) => {
     if (!amt) return;
+    const first = !(Number(t.earned) > 0 || Number(t.spent) > 0);
     onQuickUpdate({ [moneyType]: (Number(t[moneyType]) || 0) + amt });
-    setMoneyAmt(""); flash("money");
+    pop("money", first ? 5 : 0);
   };
+  const logMoney = () => { addMoney(Number(moneyAmt) || 0); setMoneyAmt(""); };
 
-  const trackGambling = (profile.vices || []).includes("Gambling");
+  const trackGambling = vices.includes("Gambling");
   const [gambleAmt, setGambleAmt] = useState("");
   const [gambleType, setGambleType] = useState("lost");
   const logGamble = () => {
@@ -1180,7 +1276,7 @@ function QuickLog({ today, profile, onQuickUpdate, onJournal, lastAI, clearAI })
     if (!amt) return;
     const key = gambleType === "lost" ? "gambleLost" : "gambleWon";
     onQuickUpdate({ [key]: (Number(t[key]) || 0) + amt });
-    setGambleAmt(""); flash("gamble");
+    setGambleAmt(""); pop("gamble", 0);
   };
 
   const [note, setNote] = useState("");
@@ -1200,11 +1296,20 @@ function QuickLog({ today, profile, onQuickUpdate, onJournal, lastAI, clearAI })
           {lastAI.summary ? <span style={S.toastSub}>{lastAI.summary}</span> : null}
         </div>
       )}
-      <div style={S.kicker}>Today</div>
-      <h1 style={S.name}>Quick log</h1>
-      <p style={S.dim}>Tap things as they happen — no need to fill it all out at once.</p>
+      <div style={S.logHeader}>
+        <div>
+          <div style={S.kicker}>Today</div>
+          <h1 style={S.name}>Quick log</h1>
+        </div>
+        <div style={S.logHeaderStats}>
+          <span style={S.streakBadge}>🔥 {d?.streak || 0}</span>
+          <span style={S.xpBadge}>✦ {todayXP} XP</span>
+        </div>
+      </div>
 
-      <QuickCard title="Meals" saved={["breakfast", "lunch", "dinner"].includes(flashKey)}>
+      <TodaysPage checklist={checklist} sealed={sealed} doneCount={doneCount} />
+
+      <QuickCard title="Meals" flash={flashFor(["breakfast", "lunch", "dinner"])}>
         {["breakfast", "lunch", "dinner"].map((m) => (
           <div key={m} style={S.mealRow}>
             <span style={S.mealName}>{m[0].toUpperCase() + m.slice(1)}</span>
@@ -1217,33 +1322,63 @@ function QuickLog({ today, profile, onQuickUpdate, onJournal, lastAI, clearAI })
         ))}
       </QuickCard>
 
-      <QuickCard title="Sleep last night" saved={flashKey === "sleep"}>
-        <Slider label="Hours" value={t.sleep || 7} min={3} max={12} step={0.5} suffix="h" onChange={setSleep} />
+      <QuickCard title="Sleep last night" flash={flashFor(["sleep"])}>
+        <div style={S.segwrap}>
+          {SLEEP_PRESETS.map((h) => (
+            <button key={h} className="seg" onClick={() => setSleep(h)} style={{ ...S.seg, ...(Number(t.sleep) === h ? S.segOn : {}) }}>{h}h</button>
+          ))}
+        </div>
+        <div style={{ marginTop: 10 }}>
+          <Slider label="Fine-tune" value={t.sleep || 7} min={3} max={12} step={0.5} suffix="h" onChange={setSleep} />
+        </div>
       </QuickCard>
 
+      {vices.length > 0 && (
+        <QuickCard title="Vice check-in" flash={flashFor(vices.map((v) => "vice:" + v))}>
+          {vices.map((v) => {
+            const vl = (t.viceLog || {})[v];
+            return (
+              <div key={v} style={S.viceRow}>
+                <span style={S.viceName}>{viceShort(v)}</span>
+                <div style={S.segwrap}>
+                  <button className="seg" onClick={() => setVice(v, "clean")} style={{ ...S.seg, ...(vl?.clean ? S.segClean : {}) }}>Clean ✓</button>
+                  <button className="seg" onClick={() => setVice(v, "slip")} style={{ ...S.seg, ...(vl?.slips > 0 ? S.segSlip : {}) }}>{vl?.slips > 0 ? `Slipped ×${vl.slips}` : "Slipped"}</button>
+                </div>
+              </div>
+            );
+          })}
+          <div style={S.quickTotal}>A clean day earns +10 XP per vice. Slips are just data — log them honestly.</div>
+        </QuickCard>
+      )}
+
       <div style={S.two}>
-        <QuickCard title="Workouts" saved={flashKey === "workouts"} compact>
+        <QuickCard title="Workouts" flash={flashFor(["workouts"])} compact>
           <Stepper label="Today" value={t.workouts || 0} onChange={setWorkouts} max={10} />
         </QuickCard>
-        <QuickCard title="Drinks" saved={flashKey === "drinks"} compact>
+        <QuickCard title="Drinks" flash={flashFor(["drinks"])} compact>
           <Stepper label="Today" value={t.drinks || 0} onChange={setDrinks} max={30} />
         </QuickCard>
       </div>
 
-      <QuickCard title="Money" saved={flashKey === "money"}>
+      <QuickCard title="Money" flash={flashFor(["money"])}>
         <div style={S.segwrap}>
           <button className="seg" onClick={() => setMoneyType("earned")} style={{ ...S.seg, ...(moneyType === "earned" ? S.segOn : {}) }}>Earned</button>
           <button className="seg" onClick={() => setMoneyType("spent")} style={{ ...S.seg, ...(moneyType === "spent" ? S.segOn : {}) }}>Spent</button>
         </div>
+        <div style={{ ...S.segwrap, marginTop: 8 }}>
+          {MONEY_PRESETS.map((amt) => (
+            <button key={amt} className="seg" onClick={() => addMoney(amt)} style={S.seg}>+${amt}</button>
+          ))}
+        </div>
         <div style={S.quickAddRow}>
-          <input className="inp" style={S.input} type="number" placeholder="$0" value={moneyAmt} onChange={(e) => setMoneyAmt(e.target.value)} />
+          <input className="inp" style={S.input} type="number" placeholder="Custom $" value={moneyAmt} onChange={(e) => setMoneyAmt(e.target.value)} />
           <button className="btn-ghost" style={S.quickAddBtn} onClick={logMoney}>Log</button>
         </div>
         <div style={S.quickTotal}>Today: {fmtMoney(t.earned || 0)} earned · {fmtMoney(t.spent || 0)} spent</div>
       </QuickCard>
 
       {trackGambling && (
-        <QuickCard title="Gambling" saved={flashKey === "gamble"}>
+        <QuickCard title="Gambling" flash={flashFor(["gamble"])}>
           <div style={S.segwrap}>
             <button className="seg" onClick={() => setGambleType("won")} style={{ ...S.seg, ...(gambleType === "won" ? S.segOn : {}) }}>Won</button>
             <button className="seg" onClick={() => setGambleType("lost")} style={{ ...S.seg, ...(gambleType === "lost" ? S.segOn : {}) }}>Lost</button>
@@ -1255,7 +1390,7 @@ function QuickLog({ today, profile, onQuickUpdate, onJournal, lastAI, clearAI })
         </QuickCard>
       )}
 
-      <Section title="Journal (optional)">
+      <Section title="Journal · +15 XP">
         <p style={S.dim}>Write anything — the Scribe reads it, fills in gaps, and might hand you a quest.</p>
         <textarea className="inp" style={{ ...S.input, minHeight: 90, resize: "vertical" }} value={note} placeholder="e.g. gambled and lost $500 · felt sick today · pulled an all-nighter" onChange={(e) => setNote(e.target.value)} />
         <button className="btn-primary" style={{ ...S.btnPrimary, width: "100%", marginTop: 10, opacity: busy || !note.trim() ? 0.6 : 1 }} disabled={busy || !note.trim()} onClick={submitNote}>
@@ -1266,12 +1401,41 @@ function QuickLog({ today, profile, onQuickUpdate, onJournal, lastAI, clearAI })
   );
 }
 
-function QuickCard({ title, children, saved, compact }) {
+// The daily "close the ring" card: segmented progress across today's
+// loggable moments. Sealing the page is the thing you come back for.
+function TodaysPage({ checklist, sealed, doneCount }) {
+  return (
+    <div style={{ ...S.pageCard, ...(sealed ? S.pageCardSealed : {}) }}>
+      <div style={S.pageCardHead}>
+        <span style={S.quickCardTitle}>{sealed ? "✶ Page sealed" : "Today's page"}</span>
+        <span style={S.pageCount}>{doneCount}/{checklist.length}</span>
+      </div>
+      <div style={S.pageSegs}>
+        {checklist.map((c) => <span key={c.key} style={{ ...S.pageSeg, background: c.done ? C.goldHi : "transparent" }} />)}
+      </div>
+      <div style={S.pageChips}>
+        {checklist.map((c) => (
+          <span key={c.key} style={{ ...S.pageChip, color: c.done ? C.sage : C.dim, borderColor: c.done ? C.sage : C.line }}>
+            {c.done ? "✓ " : ""}{c.label}
+          </span>
+        ))}
+      </div>
+      {sealed && <div style={S.pageSealedNote}>Every entry recorded. The Chronicle remembers this day.</div>}
+    </div>
+  );
+}
+
+function QuickCard({ title, children, flash, compact }) {
   return (
     <div style={{ ...S.quickCard, ...(compact ? S.quickCardCompact : {}) }}>
       <div style={S.quickCardHead}>
         <span style={S.quickCardTitle}>{title}</span>
-        {saved && <span style={S.quickSaved}>✓ saved</span>}
+        {flash && (
+          <span key={flash.at} style={S.quickSavedWrap}>
+            <span style={S.quickSaved}>✓ saved</span>
+            {flash.xp > 0 && <span className="xpfloat" style={S.xpFloat}>+{flash.xp} ✦</span>}
+          </span>
+        )}
       </div>
       {children}
     </div>
@@ -1519,23 +1683,53 @@ const S = {
   seg: { flex: 1, padding: "7px 0", fontSize: 11, borderRadius: 7, border: `1px solid ${C.line}`, background: C.ink2, color: C.dim, cursor: "pointer", fontFamily: "'Inter',sans-serif" },
   segOn: { background: C.gold, color: C.ink, borderColor: C.gold, fontWeight: 700 },
 
-  quickCard: { background: C.card, border: `1px solid ${C.line}`, borderRadius: 12, padding: 14, marginBottom: 12, flex: 1 },
+  quickCard: { background: `linear-gradient(180deg, rgba(234,208,138,.04), rgba(0,0,0,0) 40%), ${C.card}`, border: `1px solid ${C.line}`, borderRadius: 14, padding: 14, marginBottom: 12, flex: 1, boxShadow: "inset 0 1px 0 rgba(234,208,138,.06), 0 2px 8px rgba(0,0,0,.25)" },
   quickCardCompact: { padding: "12px 14px" },
   quickCardHead: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 },
   quickCardTitle: { fontFamily: "'Cinzel', serif", fontSize: 12.5, letterSpacing: 1, textTransform: "uppercase", color: C.gold },
+  quickSavedWrap: { display: "inline-flex", alignItems: "center", gap: 8, position: "relative" },
   quickSaved: { fontSize: 10.5, color: C.sage, fontWeight: 600 },
+  xpFloat: { fontSize: 11, color: C.goldHi, fontWeight: 700, textShadow: "0 0 8px rgba(234,208,138,.6)" },
   quickAddRow: { display: "flex", gap: 8, marginTop: 10 },
   quickAddBtn: { padding: "0 16px", fontSize: 12 },
   quickTotal: { fontSize: 11, color: C.dim, marginTop: 8 },
 
+  logHeader: { display: "flex", justifyContent: "space-between", alignItems: "flex-end", marginBottom: 12 },
+  logHeaderStats: { display: "flex", gap: 6, paddingBottom: 6 },
+  streakBadge: { fontSize: 11.5, fontWeight: 700, color: C.parch, border: `1px solid ${C.line}`, borderRadius: 20, padding: "4px 10px", background: C.card },
+  xpBadge: { fontSize: 11.5, fontWeight: 700, color: C.goldHi, border: `1px solid ${C.gold}`, borderRadius: 20, padding: "4px 10px", background: "rgba(200,169,110,.1)" },
+
+  pageCard: { background: `linear-gradient(180deg, rgba(234,208,138,.05), rgba(0,0,0,0) 50%), ${C.card}`, border: `1px solid ${C.line}`, borderRadius: 14, padding: 14, marginBottom: 14, boxShadow: "inset 0 1px 0 rgba(234,208,138,.07)" },
+  pageCardSealed: { borderColor: C.gold, boxShadow: "inset 0 1px 0 rgba(234,208,138,.1), 0 0 18px rgba(234,208,138,.12)" },
+  pageCardHead: { display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 9 },
+  pageCount: { fontFamily: "'Cinzel', serif", fontSize: 13, fontWeight: 700, color: C.goldHi },
+  pageSegs: { display: "flex", gap: 5, marginBottom: 10 },
+  pageSegsSmall: { display: "flex", gap: 4, flexShrink: 0, marginLeft: 12 },
+  pageSeg: { flex: 1, minWidth: 12, height: 5, borderRadius: 3, border: `1px solid ${C.gold}`, transition: "background .25s" },
+  pageChips: { display: "flex", flexWrap: "wrap", gap: 5 },
+  pageChip: { fontSize: 10, letterSpacing: 0.4, border: "1px solid", borderRadius: 12, padding: "2px 8px", transition: "color .2s, border-color .2s" },
+  pageSealedNote: { marginTop: 10, fontSize: 11.5, color: C.sage, fontStyle: "italic" },
+
+  pageBanner: { width: "100%", display: "flex", alignItems: "center", justifyContent: "space-between", textAlign: "left", background: `linear-gradient(135deg, rgba(188,77,46,.16), rgba(200,169,110,.08))`, border: `1px solid ${C.line}`, borderRadius: 12, padding: "12px 14px", marginTop: 14, cursor: "pointer", fontFamily: "'Inter', sans-serif" },
+  pageBannerSealed: { background: "rgba(134,160,99,.1)", borderColor: C.sage },
+  pageBannerLeft: { display: "flex", flexDirection: "column", gap: 3, minWidth: 0 },
+  pageBannerTitle: { fontFamily: "'Cinzel', serif", fontSize: 13, color: C.parch, fontWeight: 700 },
+  pageBannerSub: { fontSize: 11, color: C.dim },
+
+  viceRow: { display: "flex", alignItems: "center", gap: 10, marginBottom: 8 },
+  viceName: { width: 74, fontSize: 12.5, color: C.parch },
+  segClean: { background: C.sage, color: C.ink, borderColor: C.sage, fontWeight: 700 },
+  segSlip: { background: C.ember, color: C.parch, borderColor: C.ember, fontWeight: 700 },
+
   btnPrimary: { background: `linear-gradient(135deg, ${C.ember}, #8E3A22)`, color: C.parch, border: `1px solid ${C.gold}`, padding: "13px 16px", borderRadius: 10, fontFamily: "'Cinzel', serif", fontSize: 13, letterSpacing: 1, cursor: "pointer", fontWeight: 600, boxShadow: "inset 0 1px 0 rgba(255,255,255,.15), 0 3px 8px rgba(0,0,0,.35)" },
   btnGhost: { background: "transparent", color: C.parch, border: `1px solid ${C.line}`, padding: "13px 16px", borderRadius: 10, fontFamily: "'Cinzel', serif", fontSize: 12, letterSpacing: 1, cursor: "pointer" },
 
-  nav: { position: "sticky", bottom: 0, display: "flex", background: "rgba(19,16,11,.94)", borderTop: `1px solid ${C.line}`, backdropFilter: "blur(8px)" },
-  navBtn: { flex: 1, background: "none", border: "none", padding: "10px 0 12px", cursor: "pointer", display: "flex", flexDirection: "column", alignItems: "center", gap: 3, position: "relative" },
-  navIcon: { fontSize: 17 },
-  navLabel: { fontSize: 10, letterSpacing: 1, fontFamily: "'Cinzel', serif" },
-  navDot: { position: "absolute", top: 4, width: 4, height: 4, borderRadius: "50%", background: C.goldHi },
+  nav: { position: "sticky", bottom: 0, display: "flex", background: "rgba(19,16,11,.96)", borderTop: `1px solid ${C.line}`, backdropFilter: "blur(10px)", boxShadow: "0 -6px 18px rgba(0,0,0,.35)", paddingBottom: "env(safe-area-inset-bottom, 0px)" },
+  navBtn: { flex: 1, background: "none", border: "none", padding: "9px 0 11px", cursor: "pointer", display: "flex", flexDirection: "column", alignItems: "center", gap: 4, position: "relative" },
+  navIconWrap: { width: 42, height: 26, display: "flex", alignItems: "center", justifyContent: "center", borderRadius: 14, transition: "background .2s, box-shadow .2s" },
+  navIconWrapOn: { background: "rgba(200,169,110,.15)", boxShadow: "0 0 12px rgba(234,208,138,.25)" },
+  navIcon: { fontSize: 16 },
+  navLabel: { fontSize: 10, letterSpacing: 1, fontFamily: "'Cinzel', serif", transition: "letter-spacing .2s" },
 };
 
 const CSS = `
@@ -1551,7 +1745,11 @@ const CSS = `
 .pinkey:hover { background: rgba(200,169,110,.12); }
 .pinkey:active { transform: scale(.94); }
 .bgcard:hover { border-color: ${C.gold}; }
+.pagebanner:hover { border-color: ${C.gold}; }
+.pagebanner:active { transform: scale(.985); }
+.xpfloat { display: inline-block; animation: xpfloat 1.3s ease-out forwards; }
 ::-webkit-scrollbar { width: 0; }
 @keyframes pinshake { 0%, 100% { transform: translateX(0); } 25% { transform: translateX(-8px); } 75% { transform: translateX(8px); } }
+@keyframes xpfloat { 0% { transform: translateY(4px); opacity: 0; } 20% { transform: translateY(0); opacity: 1; } 70% { opacity: 1; } 100% { transform: translateY(-10px); opacity: 0; } }
 @media (prefers-reduced-motion: reduce) { * { transition: none !important; animation: none !important; } }
 `;
