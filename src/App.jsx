@@ -24,8 +24,19 @@ const CONFIG = {
     { at: 0, name: "Wanderer" }, { at: 3, name: "Squire" }, { at: 8, name: "Chronicler" },
     { at: 16, name: "Knight" }, { at: 28, name: "Warden" }, { at: 45, name: "Sage" }, { at: 70, name: "Legend" },
   ],
-  // The only quest types the AI may invent. Keeps dynamic quests evaluable.
-  questMetrics: ["avoid_tag", "hit_workouts", "limit_drinks", "save_amount", "log_streak"],
+  // The only quest types the AI may invent. The first 5 are auto-scored from
+  // your data; "narrative" is self-reported (you mark it fulfilled yourself)
+  // so the AI can propose something evocative it has no formula for.
+  questMetrics: ["avoid_tag", "hit_workouts", "limit_drinks", "save_amount", "log_streak", "narrative"],
+  // Life-path chosen at character creation. Purely a small starting nudge —
+  // your actual habits still drive the attributes long-term.
+  backgrounds: [
+    { id: "laborer", label: "The Laborer", desc: "Years of hard, physical work hardened you.", bonus: { Might: 10 } },
+    { id: "scholar", label: "The Scholar", desc: "You spent your youth buried in books.", bonus: { Spirit: 10 } },
+    { id: "merchant", label: "The Merchant", desc: "You learned the true weight of a coin early.", bonus: { Fortune: 10 } },
+    { id: "ascetic", label: "The Ascetic", desc: "Discipline over indulgence, always.", bonus: { Temperance: 10 } },
+    { id: "drifter", label: "The Drifter", desc: "No fixed trade — just grit and endurance.", bonus: { Vitality: 10 } },
+  ],
 };
 
 const MEAL_PTS = { healthy: 5, mixed: 3, junk: 1, skipped: 2.5 };
@@ -36,20 +47,26 @@ const MEAL_OPTS = [["healthy", "Healthy"], ["mixed", "Mixed"], ["junk", "Junk"],
    ===================================================================== */
 const MIMO_SYSTEM_PROMPT =
 `You are the LEDGER SCRIBE for an app called Life Ledger — a real-life tracker styled as an RPG.
-You receive a player's profile and ONE new journal entry: structured fields plus a free-text note.
+You receive a player's profile (including their chosen background/class and physical stats) and
+ONE new journal entry: structured fields plus a free-text note. This is a real person trying to
+actually improve their real life — take the job seriously. Read carefully and act like an active
+coach who's paying attention across entries, not a form validator.
 
 YOUR JOB
 1. Turn messy input into clean structured data the app's deterministic engine can use.
 2. Read the free-text note and EXTRACT anything notable not already in the fields
    (money won/lost gambling, junk food, skipped workouts, illness, overtime, big purchases, etc).
-3. Optionally propose ONE new quest tailored to what the player did or should do next.
+3. Propose ONE new quest when it's warranted — tailored to what the player actually wrote, not a
+   generic template. Prefer inventing something specific and a little evocative over skipping it,
+   especially if the note reveals a real struggle or goal worth naming.
 
 RULES
 - Never invent facts the entry doesn't support. If a field isn't implied, return null for it.
 - Only fill a structured field if the note implies a value the form missed. Don't overwrite given values.
 - Money: "earned"/"spent" are normal income/expenses. Gambling is SEPARATE — put it in "gambling".
-- No medical diagnosis. Keep any guidance gentle, specific, non-extreme, encouraging.
-- "insight" is ONE short sentence in a warm scribe voice.
+- No medical diagnosis. Keep any guidance gentle, specific, non-extreme, encouraging — but don't be
+  vague or generic either. Reference the actual thing they wrote.
+- "insight" is ONE short sentence in a warm scribe voice, specific to this entry.
 - tags: short lowercase kebab labels for themes, e.g. ["gambling","junk-food","overtime"].
 - newQuest is null OR an object whose "metric" is EXACTLY one of:
   ${CONFIG.questMetrics.join(", ")}.
@@ -58,12 +75,18 @@ RULES
     limit_drinks→ "target" = max drinks/week.
     save_amount → "target" = dollars to bank.
     log_streak  → "target" = entries in a row.
-  Quest "title" <= 4 words, "desc" <= 10 words. Don't repeat a quest title already active.
+    narrative   → for anything the other 5 metrics can't measure (a specific personal goal,
+                  a one-off challenge, a habit to build that isn't in the form). No target/tag
+                  needed — the player marks it fulfilled themselves. Use this freely; it's where
+                  you get to be genuinely creative and specific to THIS person's life, in-world
+                  flavor encouraged (tie it to their background/class if it fits naturally).
+  Quest "title" <= 5 words, "desc" <= 14 words, can be a little vivid/thematic. Don't repeat a
+  quest title already active.
 
 OUTPUT: respond with ONLY valid JSON, no markdown, no preamble, EXACTLY this shape:
 {
   "summary": "one short plain-language line summarizing this entry",
-  "insight": "one warm coaching sentence",
+  "insight": "one warm, specific coaching sentence — reference what they actually wrote",
   "extracted": {
     "workouts": number|null, "drinks": number|null, "sleep": number|null,
     "dietScore": number|null, "mood": number|null,
@@ -75,14 +98,17 @@ OUTPUT: respond with ONLY valid JSON, no markdown, no preamble, EXACTLY this sha
 }`;
 
 const ORACLE_SYSTEM_PROMPT =
-`You are THE ORACLE inside Life Ledger — a wise, encouraging life-coach voice.
-Read the player's profile + recent ledger and give grounded, general wellbeing guidance.
-No medical diagnosis, no extreme regimens, never alarmist. Reward good habits; suggest small steps.
+`You are THE ORACLE inside Life Ledger — a wise, direct, genuinely invested life-coach voice.
+Read the player's profile (background/class, physical stats) + recent ledger and give grounded,
+specific wellbeing guidance. This person opted into an AI actively helping run their self-improvement
+— don't hedge into generic platitudes. Name the actual pattern you see and say what to do about it.
+No medical diagnosis, no extreme regimens, never alarmist. Reward good habits; suggest concrete
+small steps tied to their real data, not generic advice that could apply to anyone.
 Respond with ONLY valid JSON, no markdown, exactly:
 {
-  "reading": "2-3 sentence narrative of where they stand, warm oracle voice",
+  "reading": "2-3 sentence narrative of where they stand, warm but direct oracle voice",
   "observations": ["3 short specific evidence-based notes about their habits/trends"],
-  "quests": [{"title":"short name","why":"one line on the payoff"}],
+  "quests": [{"title":"short name","why":"one line on the payoff","metric":"one of: avoid_tag, hit_workouts, limit_drinks, save_amount, log_streak, narrative","tag":"string or null","target":number or null}],
   "forecastNote": "one line: the single habit that would move their forecast most, and why"
 }`;
 
@@ -92,6 +118,15 @@ const round1 = (n) => Math.round(n * 10) / 10;
 const fmtMoney = (n) => (n < 0 ? "-" : "") + "$" + Math.abs(Math.round(n)).toLocaleString("en-CA");
 const wk = (e, f) => (Number(e[f]) || 0) * (e.period === "day" ? 7 : 1);
 const num = (v) => (v === null || v === undefined || v === "" || isNaN(Number(v)) ? null : Number(v));
+const cmToFtIn = (cm) => { const totalIn = (Number(cm) || 0) / 2.54; const ft = Math.floor(totalIn / 12); const inch = Math.round(totalIn % 12); return { ft, inch }; };
+const ftInToCm = (ft, inch) => Math.round(((Number(ft) || 0) * 12 + (Number(inch) || 0)) * 2.54);
+const kgToLb = (kg) => Math.round((Number(kg) || 0) * 2.20462);
+const lbToKg = (lb) => Math.round((Number(lb) || 0) / 2.20462);
+function formatHW(profile) {
+  if (profile.units === "metric") return `${profile.heightCm} cm · ${profile.weightKg} kg`;
+  const { ft, inch } = cmToFtIn(profile.heightCm);
+  return `${ft}'${inch}" · ${kgToLb(profile.weightKg)} lb`;
+}
 
 function dietFromMeals(meals) {
   const vals = ["breakfast", "lunch", "dinner"].map((m) => MEAL_PTS[meals?.[m]]).filter((v) => v != null);
@@ -138,7 +173,10 @@ function computeAttributes(p, hab, gold, savingsRate, deeds, streak) {
   const fortune = clamp(goldScore * 70 + clamp(savingsRate, 0, 0.5) * 60, 0, 100);
   const temperance = clamp(50 + (10 - Math.min(hab.drinksWk, 20)) * 2.5 + Math.min(streak, 10) * 3 - clamp(hab.gambleLostWk / 40, 0, 18), 0, 100);
   const spirit = clamp(35 + (hab.mood - 3) * 14 + Math.min(deeds, 20) * 1.5, 0, 100);
-  return { Vitality: Math.round(vitality), Might: Math.round(might), Fortune: Math.round(fortune), Temperance: Math.round(temperance), Spirit: Math.round(spirit) };
+  const raw = { Vitality: vitality, Might: might, Fortune: fortune, Temperance: temperance, Spirit: spirit };
+  const bg = CONFIG.backgrounds.find((b) => b.id === p.background);
+  if (bg) for (const [k, v] of Object.entries(bg.bonus)) raw[k] = clamp(raw[k] + v, 0, 100);
+  return { Vitality: Math.round(raw.Vitality), Might: Math.round(raw.Might), Fortune: Math.round(raw.Fortune), Temperance: Math.round(raw.Temperance), Spirit: Math.round(raw.Spirit) };
 }
 
 function computeStreak(entries) {
@@ -173,6 +211,7 @@ function evalDynamic(q, d) {
     case "limit_drinks": return hab.drinksWk <= (q.target || 7) ? 1 : clamp((q.target || 7) / Math.max(hab.drinksWk, 1), 0, 1);
     case "save_amount": return clamp((gold - startGold) / (q.target || 1000), 0, 1);
     case "log_streak": return clamp(streak / (q.target || 7), 0, 1);
+    case "narrative": return q.done ? 1 : 0; // self-reported — no formula, you mark it done
     default: return 0;
   }
 }
@@ -190,7 +229,7 @@ function computeQuests(d, dynamic) {
     { id: "rest", title: "Well-Rested", desc: "Hold 7-9h sleep", p: wellRested ? 1 : clamp(hab.sleep / 7, 0, 1) },
     { id: "treasure", title: "Treasurer", desc: "Bank $1,000", p: clamp(earned / 1000, 0, 1) },
   ];
-  const dyn = (dynamic || []).map((q) => ({ id: q.id, title: q.title, desc: q.desc, ai: true, p: evalDynamic(q, d) }));
+  const dyn = (dynamic || []).map((q) => ({ id: q.id, title: q.title, desc: q.desc, ai: true, metric: q.metric, p: evalDynamic(q, d) }));
   return [...dyn, ...base];
 }
 
@@ -236,10 +275,12 @@ async function callModel(system, userObj) {
   return extractJSON(text);
 }
 
+const backgroundLabel = (id) => CONFIG.backgrounds.find((b) => b.id === id)?.label || null;
+
 // Fires on EVERY entry.
 async function processEntry(profile, entry, ctx) {
   return callModel(MIMO_SYSTEM_PROMPT, {
-    profile: { name: profile.name, age: profile.age, sex: profile.sex, place: [profile.city, profile.country].filter(Boolean).join(", "), smoker: !!profile.smoker },
+    profile: { name: profile.name, age: profile.age, sex: profile.sex, place: [profile.city, profile.country].filter(Boolean).join(", "), smoker: !!profile.smoker, background: backgroundLabel(profile.background), heightCm: profile.heightCm || null, weightKg: profile.weightKg || null },
     entry, recentTags: ctx.recentTags, activeQuestTitles: ctx.activeQuestTitles,
   });
 }
@@ -248,7 +289,7 @@ async function processEntry(profile, entry, ctx) {
 async function askOracle(profile, entries, d) {
   const ledger = entries.slice(0, 8).map((e) => ({ date: e.date, period: e.period, workouts: e.workouts, drinks: e.drinks, sleep: e.sleep, diet: e.diet, mood: e.mood, gambleLost: e.gambleLost, saved: (Number(e.earned) || 0) - (Number(e.spent) || 0), tags: e.tags }));
   return callModel(ORACLE_SYSTEM_PROMPT, {
-    profile: { name: profile.name, age: profile.age, sex: profile.sex, smoker: !!profile.smoker },
+    profile: { name: profile.name, age: profile.age, sex: profile.sex, smoker: !!profile.smoker, background: backgroundLabel(profile.background) },
     stats: { forecastYearsRemaining: d.forecast.remainingYears, potentialYearsRemaining: d.potential, attributes: d.attrs, gold: d.gold, streak: d.streak },
     recentHabitsWeekly: { workouts: round1(d.hab.workoutsWk), drinks: round1(d.hab.drinksWk), sleepHrs: round1(d.hab.sleep), diet1to5: round1(d.hab.diet), mood1to5: round1(d.hab.mood), gamblingLost: round1(d.hab.gambleLostWk) },
     ledger,
@@ -342,6 +383,13 @@ export default function App() {
   const resetAll = () => { setProfile(null); setEntries([]); setOracle(null); setDynQuests([]); [KEY_P, KEY_E, KEY_O, KEY_Q].forEach((k) => storeSet(k, k === KEY_E || k === KEY_Q ? [] : null)); setEditing(false); };
   const saveOracle = (o) => { setOracle(o); storeSet(KEY_O, o); };
   const deleteEntry = (id) => { const n = entries.filter((e) => e.id !== id); setEntries(n); storeSet(KEY_E, n); };
+  const completeQuest = (id) => { const n = dynQuests.map((q) => (q.id === id ? { ...q, done: true } : q)); setDynQuests(n); storeSet(KEY_Q, n); };
+  const adoptQuest = (q) => {
+    if (dynQuests.some((x) => x.title.toLowerCase() === q.title.toLowerCase())) return;
+    const metric = CONFIG.questMetrics.includes(q.metric) ? q.metric : "narrative";
+    const n = [{ id: "oracle_" + Date.now(), title: q.title, desc: q.why || "", metric, tag: q.tag || null, target: q.target || 0, done: false, createdAt: new Date().toISOString().slice(0, 10) }, ...dynQuests];
+    setDynQuests(n); storeSet(KEY_Q, n);
+  };
 
   // The AI-on-every-entry pipeline.
   const addEntry = async (form) => {
@@ -369,7 +417,7 @@ export default function App() {
       // dynamic quest minting (dedupe by title, only allowed metrics)
       const nq = r.newQuest;
       if (nq && nq.title && CONFIG.questMetrics.includes(nq.metric) && !dynQuests.some((q) => q.title.toLowerCase() === nq.title.toLowerCase())) {
-        const next = [{ ...nq, id: "ai_" + Date.now(), createdAt: en.date }, ...dynQuests];
+        const next = [{ ...nq, id: "ai_" + Date.now(), createdAt: en.date, done: false }, ...dynQuests];
         setDynQuests(next); storeSet(KEY_Q, next);
       }
     } catch (err) {
@@ -409,10 +457,10 @@ export default function App() {
             : !unlocked ? <PinLock expected={pinHash} onUnlock={() => setUnlocked(true)} />
             : loading ? <div style={S.loading}>Unrolling the ledger…</div>
             : !profile || editing ? <Onboard initial={profile} onSave={saveProfile} onCancel={profile ? () => setEditing(false) : null} />
-            : tab === "hero" ? <Hero profile={profile} d={d} lastAI={lastAI} clearAI={() => setLastAI(null)} onEdit={() => setEditing(true)} onReset={resetAll} onLock={lock} onChangePin={changePin} aiStatus={aiStatus} />
+            : tab === "hero" ? <Hero profile={profile} d={d} lastAI={lastAI} clearAI={() => setLastAI(null)} onEdit={() => setEditing(true)} onReset={resetAll} onLock={lock} onChangePin={changePin} onCompleteQuest={completeQuest} aiStatus={aiStatus} />
             : tab === "log" ? <LogEntry onAdd={addEntry} />
             : tab === "chronicle" ? <Chronicle entries={entries} d={d} onDelete={deleteEntry} />
-            : <Oracle profile={profile} entries={entries} d={d} cached={oracle} onResult={saveOracle} />}
+            : <Oracle profile={profile} entries={entries} d={d} cached={oracle} onResult={saveOracle} activeQuestTitles={dynQuests.map((q) => q.title)} onAdopt={adoptQuest} />}
         </div>
         {pinHash && unlocked && !loading && profile && !editing && <Nav tab={tab} setTab={setTab} />}
       </div>
@@ -516,7 +564,7 @@ function Nav({ tab, setTab }) {
 }
 
 /* ------------------------------- Hero ------------------------------ */
-function Hero({ profile, d, lastAI, clearAI, onEdit, onReset, onLock, onChangePin, aiStatus }) {
+function Hero({ profile, d, lastAI, clearAI, onEdit, onReset, onLock, onChangePin, onCompleteQuest, aiStatus }) {
   const { forecast, potential, attrs, gold, rank, deeds, streak, savingsRate, quests } = d;
   const [menu, setMenu] = useState(false);
   const lifeProgress = clamp(profile.age / forecast.estLifespan, 0, 1);
@@ -539,7 +587,8 @@ function Hero({ profile, d, lastAI, clearAI, onEdit, onReset, onLock, onChangePi
           <div>
             <div style={S.kicker}>Life Ledger of</div>
             <h1 style={S.name}>{profile.name || "Adventurer"}</h1>
-            <div style={S.subline}>Lv {profile.age} · {rank.current.name} · {profile.city || profile.country || "the realm"}</div>
+            <div style={S.subline}>Age {profile.age} · {CONFIG.backgrounds.find((b) => b.id === profile.background)?.label || "Wayfarer"} · {rank.current.name}</div>
+            <div style={S.subline2}>{[profile.city, profile.country].filter(Boolean).join(", ") || "the realm"}{profile.heightCm ? ` · ${formatHW(profile)}` : ""}</div>
           </div>
         </div>
         <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
@@ -556,7 +605,7 @@ function Hero({ profile, d, lastAI, clearAI, onEdit, onReset, onLock, onChangePi
         </div>
       )}
 
-      <section style={S.gaugeCard}>
+      <OrnateFrame style={S.gaugeCard}>
         <div style={S.gaugeHead}><span style={S.eyebrowGold}>Lifespan Forecast</span><span style={S.tinyNote}>playful estimate · not medical advice</span></div>
         <div style={S.gaugeRow}>
           <Gauge progress={lifeProgress} center={years.toFixed(1)} sub="years left" />
@@ -570,7 +619,7 @@ function Hero({ profile, d, lastAI, clearAI, onEdit, onReset, onLock, onChangePi
         {forecast.mods.length > 0 ? (
           <div style={S.mods}>{forecast.mods.map((m) => <span key={m.label} className="chip" style={{ ...S.chip, color: m.value >= 0 ? C.sage : C.ember, borderColor: m.value >= 0 ? C.sage : C.ember }}>{m.label} {m.value >= 0 ? "+" : ""}{m.value}</span>)}</div>
         ) : <div style={S.dim}>Log a deed to start moving your forecast.</div>}
-      </section>
+      </OrnateFrame>
 
       <Section title="Attributes">
         <div style={S.attrGrid}>{Object.entries(attrs).map(([k, v], i) => <AttrBar key={k} name={k} val={v} delay={i * 80} />)}</div>
@@ -588,10 +637,14 @@ function Hero({ profile, d, lastAI, clearAI, onEdit, onReset, onLock, onChangePi
             <div key={q.id} style={S.quest}>
               <div style={S.questTop}>
                 <span style={S.questTitle}>{q.title}{q.ai ? <span style={S.aiTag}>AI</span> : null}</span>
-                <span style={S.questPct}>{Math.round(q.p * 100)}%</span>
+                {q.metric !== "narrative" && <span style={S.questPct}>{Math.round(q.p * 100)}%</span>}
               </div>
               <div style={S.questDesc}>{q.desc}</div>
-              <div style={S.barBg}><div style={{ ...S.barFill, width: q.p * 100 + "%", background: C.goldHi }} /></div>
+              {q.metric === "narrative" ? (
+                <button className="btn-ghost" style={S.questFulfill} onClick={() => onCompleteQuest(q.id)}>Mark fulfilled</button>
+              ) : (
+                <div style={S.barBg}><div style={{ ...S.barFill, width: q.p * 100 + "%", background: C.goldHi }} /></div>
+              )}
             </div>
           ))}
       </Section>
@@ -640,8 +693,9 @@ function Chronicle({ entries, d, onDelete }) {
 }
 
 /* ------------------------------- Oracle ---------------------------- */
-function Oracle({ profile, entries, d, cached, onResult }) {
+function Oracle({ profile, entries, d, cached, onResult, activeQuestTitles, onAdopt }) {
   const [loading, setLoading] = useState(false), [err, setErr] = useState(null);
+  const [adopted, setAdopted] = useState([]);
   const result = cached;
   const consult = async () => {
     setLoading(true); setErr(null);
@@ -663,7 +717,19 @@ function Oracle({ profile, entries, d, cached, onResult }) {
           <div style={S.sealRow}><span style={S.seal}>✶</span><span style={S.sealLine} /></div>
           <p style={S.reading}>{result.reading}</p>
           {Array.isArray(result.observations) && result.observations.length > 0 && (<><div style={S.oracleH}>What the ledger shows</div>{result.observations.map((o, i) => <div key={i} style={S.obs}><span style={S.bullet}>◆</span><span>{o}</span></div>)}</>)}
-          {Array.isArray(result.quests) && result.quests.length > 0 && (<><div style={S.oracleH}>Quests offered</div>{result.quests.map((q, i) => <div key={i} style={S.oQuest}><div style={S.oQuestTitle}>{q.title}</div><div style={S.oQuestWhy}>{q.why}</div></div>)}</>)}
+          {Array.isArray(result.quests) && result.quests.length > 0 && (<><div style={S.oracleH}>Quests offered</div>{result.quests.map((q, i) => {
+            const already = adopted.includes(q.title) || (activeQuestTitles || []).some((t) => t.toLowerCase() === q.title.toLowerCase());
+            return (
+              <div key={i} style={S.oQuest}>
+                <div style={S.oQuestRow}>
+                  <div><div style={S.oQuestTitle}>{q.title}</div><div style={S.oQuestWhy}>{q.why}</div></div>
+                  <button className="btn-ghost" style={{ ...S.oQuestBtn, opacity: already ? 0.5 : 1 }} disabled={already} onClick={() => { onAdopt(q); setAdopted((a) => [...a, q.title]); }}>
+                    {already ? "In log" : "Take it"}
+                  </button>
+                </div>
+              </div>
+            );
+          })}</>)}
           {result.forecastNote && <div style={S.forecastNote}>⟡ {result.forecastNote}</div>}
           {result.at && <div style={S.oracleStamp}>read {new Date(result.at).toLocaleString()}</div>}
         </div>
@@ -674,28 +740,234 @@ function Oracle({ profile, entries, d, cached, onResult }) {
 
 /* ------------------------------ Onboard ---------------------------- */
 function Onboard({ initial, onSave, onCancel }) {
-  const [f, setF] = useState(initial || { name: "", age: 30, sex: "male", country: "Canada", city: "Halifax", birthplace: "", netWorth: 0, smoker: false });
+  return initial
+    ? <EditHero initial={initial} onSave={onSave} onCancel={onCancel} />
+    : <CharacterCreation onSave={onSave} />;
+}
+
+const DEFAULT_HERO = { name: "", age: 30, sex: "male", country: "", city: "", birthplace: "", netWorth: 0, smoker: false, background: "drifter", units: "imperial", heightCm: 175, weightKg: 75 };
+
+/* ---------------------- Character Creation Wizard ------------------- */
+const WIZARD_STEPS = [
+  { key: "prologue", title: "Prologue" },
+  { key: "origins", title: "Origins" },
+  { key: "body", title: "The Body" },
+  { key: "path", title: "The Path" },
+  { key: "fortune", title: "Fortune" },
+  { key: "review", title: "The Saga Begins" },
+];
+
+function CharacterCreation({ onSave }) {
+  const [step, setStep] = useState(0);
+  const [f, setF] = useState(DEFAULT_HERO);
   const set = (k, v) => setF((s) => ({ ...s, [k]: v }));
-  const valid = f.name.trim() && Number(f.age) > 0;
+  const last = step === WIZARD_STEPS.length - 1;
+  const canNext = () => {
+    switch (WIZARD_STEPS[step].key) {
+      case "prologue": return f.name.trim().length > 0;
+      case "body": return Number(f.age) > 0;
+      default: return true;
+    }
+  };
+  const next = () => canNext() && setStep((s) => Math.min(s + 1, WIZARD_STEPS.length - 1));
+  const back = () => setStep((s) => Math.max(s - 1, 0));
+  const finish = () => onSave({ ...f, age: Number(f.age), netWorth: Number(f.netWorth) || 0 });
+
   return (
     <div style={S.pad}>
-      <div style={S.kicker}>{initial ? "Edit hero" : "New game"}</div>
-      <h1 style={S.name}>{initial ? "Your hero" : "Forge your hero"}</h1>
-      <p style={S.dim}>These set your starting stats and forecast. Change anything later.</p>
-      <Field label="Name / handle"><input className="inp" style={S.input} value={f.name} placeholder="What shall the bards call you?" onChange={(e) => set("name", e.target.value)} /></Field>
+      <WizardChrome step={step} total={WIZARD_STEPS.length} title={WIZARD_STEPS[step].title} />
+      {WIZARD_STEPS[step].key === "prologue" && <StepPrologue f={f} set={set} />}
+      {WIZARD_STEPS[step].key === "origins" && <StepOrigins f={f} set={set} />}
+      {WIZARD_STEPS[step].key === "body" && <StepBody f={f} set={set} />}
+      {WIZARD_STEPS[step].key === "path" && <StepPath f={f} set={set} />}
+      {WIZARD_STEPS[step].key === "fortune" && <StepFortune f={f} set={set} />}
+      {WIZARD_STEPS[step].key === "review" && <StepReview f={f} />}
+      <div style={S.actions}>
+        {step > 0 && <button className="btn-ghost" style={S.btnGhost} onClick={back}>Back</button>}
+        {!last
+          ? <button className="btn-primary" style={{ ...S.btnPrimary, flex: 1, opacity: canNext() ? 1 : 0.5 }} disabled={!canNext()} onClick={next}>Continue</button>
+          : <button className="btn-primary" style={{ ...S.btnPrimary, flex: 1 }} onClick={finish}>Begin your saga</button>}
+      </div>
+    </div>
+  );
+}
+
+function WizardChrome({ step, total, title }) {
+  return (
+    <div style={{ marginBottom: 6 }}>
+      <div style={S.kicker}>Chapter {step + 1} of {total}</div>
+      <h1 style={S.name}>{title}</h1>
+      <div style={S.wizDots}>{Array.from({ length: total }).map((_, i) => <span key={i} style={{ ...S.wizDot, background: i <= step ? C.goldHi : "transparent" }} />)}</div>
+    </div>
+  );
+}
+
+function StepPrologue({ f, set }) {
+  return (
+    <>
+      <p style={S.dim}>Every saga starts with a name. History will remember you by it — or won't, but it has to start somewhere.</p>
+      <Field label="Name / handle"><input className="inp" style={S.input} value={f.name} placeholder="What shall the bards call you?" onChange={(e) => set("name", e.target.value)} autoFocus /></Field>
+    </>
+  );
+}
+
+function StepOrigins({ f, set }) {
+  return (
+    <>
+      <p style={S.dim}>Where do you hail from? Pure flavor — it changes nothing but the telling of the tale.</p>
+      <div style={S.two}>
+        <Field label="Country"><input className="inp" style={S.input} value={f.country} placeholder="e.g. Canada" onChange={(e) => set("country", e.target.value)} /></Field>
+        <Field label="City"><input className="inp" style={S.input} value={f.city} placeholder="e.g. Halifax" onChange={(e) => set("city", e.target.value)} /></Field>
+      </div>
+      <Field label="Birthplace (optional)"><input className="inp" style={S.input} value={f.birthplace} onChange={(e) => set("birthplace", e.target.value)} /></Field>
+    </>
+  );
+}
+
+function StepBody({ f, set }) {
+  const imperial = f.units === "imperial";
+  const { ft, inch } = cmToFtIn(f.heightCm);
+  return (
+    <>
+      <p style={S.dim}>What do you carry into this world? These set your starting forecast — nothing here is judged, just recorded.</p>
       <div style={S.two}>
         <Field label="Age"><input className="inp" style={S.input} type="number" value={f.age} onChange={(e) => set("age", e.target.value)} /></Field>
-        <Field label="Sex (forecast)"><select className="inp" style={S.input} value={f.sex} onChange={(e) => set("sex", e.target.value)}><option value="male">Male</option><option value="female">Female</option><option value="other">Prefer not to say</option></select></Field>
+        <Field label="Sex (forecast)">
+          <select className="inp" style={S.input} value={f.sex} onChange={(e) => set("sex", e.target.value)}>
+            <option value="male">Male</option><option value="female">Female</option><option value="other">Prefer not to say</option>
+          </select>
+        </Field>
+      </div>
+      {imperial ? (
+        <div style={S.two}>
+          <Field label="Height (ft / in)">
+            <div style={{ display: "flex", gap: 8 }}>
+              <input className="inp" style={S.input} type="number" value={ft} onChange={(e) => set("heightCm", ftInToCm(e.target.value, inch))} />
+              <input className="inp" style={S.input} type="number" value={inch} onChange={(e) => set("heightCm", ftInToCm(ft, e.target.value))} />
+            </div>
+          </Field>
+          <Field label="Weight (lb)"><input className="inp" style={S.input} type="number" value={kgToLb(f.weightKg)} onChange={(e) => set("weightKg", lbToKg(e.target.value))} /></Field>
+        </div>
+      ) : (
+        <div style={S.two}>
+          <Field label="Height (cm)"><input className="inp" style={S.input} type="number" value={f.heightCm} onChange={(e) => set("heightCm", Number(e.target.value))} /></Field>
+          <Field label="Weight (kg)"><input className="inp" style={S.input} type="number" value={f.weightKg} onChange={(e) => set("weightKg", Number(e.target.value))} /></Field>
+        </div>
+      )}
+      <button className="btn-ghost" style={S.unitSwitch} onClick={() => set("units", imperial ? "metric" : "imperial")}>Switch to {imperial ? "metric" : "imperial"}</button>
+      <label style={S.check}><input type="checkbox" checked={f.smoker} onChange={(e) => set("smoker", e.target.checked)} /><span>I smoke / use tobacco</span></label>
+    </>
+  );
+}
+
+function StepPath({ f, set }) {
+  return (
+    <>
+      <p style={S.dim}>Before the ledger began, what were you? This sets one starting attribute — your habits do the rest.</p>
+      <div style={S.bgGrid}>
+        {CONFIG.backgrounds.map((b) => (
+          <button key={b.id} className="bgcard" style={{ ...S.bgCard, ...(f.background === b.id ? S.bgCardOn : {}) }} onClick={() => set("background", b.id)}>
+            <div style={S.bgLabel}>{b.label}</div>
+            <div style={S.bgDesc}>{b.desc}</div>
+            <div style={S.bgBonus}>+{Object.values(b.bonus)[0]} {Object.keys(b.bonus)[0]}</div>
+          </button>
+        ))}
+      </div>
+    </>
+  );
+}
+
+function StepFortune({ f, set }) {
+  return (
+    <>
+      <p style={S.dim}>What do you have to your name, before the first deed is ever logged?</p>
+      <Field label="Starting gold — savings / net worth ($)"><input className="inp" style={S.input} type="number" value={f.netWorth} onChange={(e) => set("netWorth", e.target.value)} /></Field>
+    </>
+  );
+}
+
+function StepReview({ f }) {
+  const bg = CONFIG.backgrounds.find((b) => b.id === f.background);
+  const imperial = f.units === "imperial";
+  const { ft, inch } = cmToFtIn(f.heightCm);
+  const heightDisplay = imperial ? `${ft}'${inch}"` : `${f.heightCm} cm`;
+  const weightDisplay = imperial ? `${kgToLb(f.weightKg)} lb` : `${f.weightKg} kg`;
+  return (
+    <>
+      <p style={S.dim}>Your saga is about to begin.</p>
+      <OrnateFrame style={S.reviewCard}>
+        <Crest initial={(f.name || "A")[0].toUpperCase()} />
+        <div style={S.reviewName}>{f.name || "Unnamed"}</div>
+        <div style={S.reviewSub}>{bg?.label} · {[f.city, f.country].filter(Boolean).join(", ") || "Unknown origin"}</div>
+        <div style={S.reviewGrid}>
+          <ReviewStat k="Age" v={f.age} />
+          <ReviewStat k="Height" v={heightDisplay} />
+          <ReviewStat k="Weight" v={weightDisplay} />
+          <ReviewStat k="Gold" v={fmtMoney(Number(f.netWorth) || 0)} />
+        </div>
+      </OrnateFrame>
+    </>
+  );
+}
+function ReviewStat({ k, v }) { return (<div style={S.reviewStat}><div style={S.reviewStatK}>{k}</div><div style={S.reviewStatV}>{v}</div></div>); }
+
+/* ---------------------------- Edit Hero ------------------------------ */
+function EditHero({ initial, onSave, onCancel }) {
+  const [f, setF] = useState({ ...DEFAULT_HERO, ...initial });
+  const set = (k, v) => setF((s) => ({ ...s, [k]: v }));
+  const valid = f.name.trim() && Number(f.age) > 0;
+  const imperial = f.units === "imperial";
+  const { ft, inch } = cmToFtIn(f.heightCm);
+  return (
+    <div style={S.pad}>
+      <div style={S.kicker}>Edit hero</div>
+      <h1 style={S.name}>Your hero</h1>
+      <p style={S.dim}>Change anything. Your background bonus applies immediately.</p>
+      <Field label="Name / handle"><input className="inp" style={S.input} value={f.name} onChange={(e) => set("name", e.target.value)} /></Field>
+      <div style={S.two}>
+        <Field label="Age"><input className="inp" style={S.input} type="number" value={f.age} onChange={(e) => set("age", e.target.value)} /></Field>
+        <Field label="Sex (forecast)">
+          <select className="inp" style={S.input} value={f.sex} onChange={(e) => set("sex", e.target.value)}>
+            <option value="male">Male</option><option value="female">Female</option><option value="other">Prefer not to say</option>
+          </select>
+        </Field>
       </div>
       <div style={S.two}>
         <Field label="Country"><input className="inp" style={S.input} value={f.country} onChange={(e) => set("country", e.target.value)} /></Field>
         <Field label="City"><input className="inp" style={S.input} value={f.city} onChange={(e) => set("city", e.target.value)} /></Field>
       </div>
       <Field label="Birthplace (optional)"><input className="inp" style={S.input} value={f.birthplace} onChange={(e) => set("birthplace", e.target.value)} /></Field>
-      <Field label="Starting gold — savings / net worth ($)"><input className="inp" style={S.input} type="number" value={f.netWorth} onChange={(e) => set("netWorth", e.target.value)} /></Field>
+      {imperial ? (
+        <div style={S.two}>
+          <Field label="Height (ft / in)">
+            <div style={{ display: "flex", gap: 8 }}>
+              <input className="inp" style={S.input} type="number" value={ft} onChange={(e) => set("heightCm", ftInToCm(e.target.value, inch))} />
+              <input className="inp" style={S.input} type="number" value={inch} onChange={(e) => set("heightCm", ftInToCm(ft, e.target.value))} />
+            </div>
+          </Field>
+          <Field label="Weight (lb)"><input className="inp" style={S.input} type="number" value={kgToLb(f.weightKg)} onChange={(e) => set("weightKg", lbToKg(e.target.value))} /></Field>
+        </div>
+      ) : (
+        <div style={S.two}>
+          <Field label="Height (cm)"><input className="inp" style={S.input} type="number" value={f.heightCm} onChange={(e) => set("heightCm", Number(e.target.value))} /></Field>
+          <Field label="Weight (kg)"><input className="inp" style={S.input} type="number" value={f.weightKg} onChange={(e) => set("weightKg", Number(e.target.value))} /></Field>
+        </div>
+      )}
+      <button className="btn-ghost" style={S.unitSwitch} onClick={() => set("units", imperial ? "metric" : "imperial")}>Switch to {imperial ? "metric" : "imperial"}</button>
+      <div style={S.fieldLabel}>Background</div>
+      <div style={S.bgGrid}>
+        {CONFIG.backgrounds.map((b) => (
+          <button key={b.id} className="bgcard" style={{ ...S.bgCard, ...(f.background === b.id ? S.bgCardOn : {}) }} onClick={() => set("background", b.id)}>
+            <div style={S.bgLabel}>{b.label}</div>
+            <div style={S.bgDesc}>{b.desc}</div>
+            <div style={S.bgBonus}>+{Object.values(b.bonus)[0]} {Object.keys(b.bonus)[0]}</div>
+          </button>
+        ))}
+      </div>
+      <Field label="Gold — savings / net worth ($)"><input className="inp" style={S.input} type="number" value={f.netWorth} onChange={(e) => set("netWorth", e.target.value)} /></Field>
       <label style={S.check}><input type="checkbox" checked={f.smoker} onChange={(e) => set("smoker", e.target.checked)} /><span>I smoke / use tobacco</span></label>
       <div style={S.actions}>
-        <button className="btn-primary" style={{ ...S.btnPrimary, flex: 1, opacity: valid ? 1 : 0.5 }} disabled={!valid} onClick={() => onSave({ ...f, age: Number(f.age), netWorth: Number(f.netWorth) || 0 })}>{initial ? "Save" : "Begin"}</button>
+        <button className="btn-primary" style={{ ...S.btnPrimary, flex: 1, opacity: valid ? 1 : 0.5 }} disabled={!valid} onClick={() => onSave({ ...f, age: Number(f.age), netWorth: Number(f.netWorth) || 0 })}>Save</button>
         {onCancel && <button className="btn-ghost" style={S.btnGhost} onClick={onCancel}>Cancel</button>}
       </div>
     </div>
@@ -768,7 +1040,33 @@ function StatusPill({ status }) {
     </span>
   );
 }
-function Section({ title, children }) { return (<section style={S.section}><h2 style={S.h2}>{title}</h2>{children}</section>); }
+function Section({ title, children }) {
+  return (
+    <section style={S.section}>
+      <div style={S.sectionHead}><span style={S.sectionDiamond}>◆</span><h2 style={S.h2}>{title}</h2><span style={S.sectionLine} /></div>
+      {children}
+    </section>
+  );
+}
+function OrnateFrame({ children, style }) {
+  return (
+    <section style={{ position: "relative", ...style }}>
+      <CornerFlourish corner={{ top: -1, left: -1 }} />
+      <CornerFlourish corner={{ top: -1, right: -1 }} flip="scaleX(-1)" />
+      <CornerFlourish corner={{ bottom: -1, left: -1 }} flip="scaleY(-1)" />
+      <CornerFlourish corner={{ bottom: -1, right: -1 }} flip="scale(-1,-1)" />
+      {children}
+    </section>
+  );
+}
+function CornerFlourish({ corner, flip }) {
+  return (
+    <svg width="22" height="22" viewBox="0 0 22 22" style={{ position: "absolute", pointerEvents: "none", transform: flip, ...corner }}>
+      <path d="M2 20 V6 Q2 2 6 2 H20" fill="none" stroke={C.gold} strokeWidth="1.5" />
+      <circle cx="2" cy="20" r="1.7" fill={C.goldHi} />
+    </svg>
+  );
+}
 function Field({ label, children }) { return (<label style={S.field}><span style={S.fieldLabel}>{label}</span>{children}</label>); }
 function Stat({ k, v, accent }) { return (<div style={S.sStat}><span style={S.sStatK}>{k}</span><span style={{ ...S.sStatV, color: accent ? C.sage : C.parch }}>{v}</span></div>); }
 function Mini({ label, big, sub, pct }) { return (<div style={S.mini}><div style={S.miniLabel}>{label}</div><div style={S.miniBig}>{big}</div>{pct != null && <div style={S.barBg}><div style={{ ...S.barFill, width: pct + "%", background: C.goldHi }} /></div>}<div style={S.miniSub}>{sub}</div></div>); }
@@ -822,14 +1120,18 @@ function Trend({ title, series, color, fmt }) {
 
 /* ------------------------------ styles ----------------------------- */
 const S = {
-  root: { minHeight: "100vh", background: C.ink, display: "flex", justifyContent: "center" },
-  frame: { width: "100%", maxWidth: 460, minHeight: "100vh", color: C.parch, fontFamily: "'Inter', system-ui, sans-serif", display: "flex", flexDirection: "column", position: "relative" },
+  root: {
+    minHeight: "100vh", display: "flex", justifyContent: "center",
+    background: `radial-gradient(120% 70% at 50% -10%, ${C.card} 0%, ${C.ink} 60%), radial-gradient(140% 90% at 50% 115%, rgba(0,0,0,.65), transparent)`,
+  },
+  frame: { width: "100%", maxWidth: 460, minHeight: "100vh", color: C.parch, fontFamily: "'Inter', system-ui, sans-serif", display: "flex", flexDirection: "column", position: "relative", boxShadow: "inset 0 0 80px rgba(0,0,0,.5)" },
   scroll: { flex: 1, overflowY: "auto", paddingBottom: 86 },
   pad: { padding: "22px 18px 8px" },
   loading: { textAlign: "center", padding: "120px 0", color: C.dim, fontFamily: "'Cinzel', serif", letterSpacing: 1 },
   kicker: { fontFamily: "'Cinzel', serif", fontSize: 11, letterSpacing: 3, textTransform: "uppercase", color: C.gold },
   name: { fontFamily: "'Cinzel', serif", fontSize: 28, fontWeight: 700, margin: "2px 0 4px", color: C.parch, lineHeight: 1.05 },
   subline: { fontSize: 12.5, color: C.dim },
+  subline2: { fontSize: 11, color: C.dim, opacity: 0.75, marginTop: 1 },
   dim: { fontSize: 13, color: C.dim, lineHeight: 1.5 },
 
   toast: { background: "rgba(134,160,99,.12)", border: `1px solid ${C.line}`, borderRadius: 10, padding: "9px 12px", marginBottom: 14, cursor: "pointer", display: "flex", flexDirection: "column", gap: 2 },
@@ -859,7 +1161,10 @@ const S = {
   chip: { fontSize: 11, fontWeight: 600, padding: "3px 9px", borderRadius: 20, border: "1px solid", background: "rgba(0,0,0,.2)" },
 
   section: { marginTop: 22 },
-  h2: { fontFamily: "'Cinzel', serif", fontSize: 13, letterSpacing: 2, textTransform: "uppercase", color: C.gold, marginBottom: 10 },
+  sectionHead: { display: "flex", alignItems: "center", gap: 8, marginBottom: 10 },
+  sectionDiamond: { color: C.gold, fontSize: 9 },
+  h2: { fontFamily: "'Cinzel', serif", fontSize: 13, letterSpacing: 2, textTransform: "uppercase", color: C.gold, margin: 0, whiteSpace: "nowrap" },
+  sectionLine: { flex: 1, height: 1, background: `linear-gradient(90deg, ${C.line}, transparent)` },
   attrGrid: { display: "flex", flexDirection: "column", gap: 9 },
   attrRow: { display: "flex", alignItems: "center", gap: 10 },
   attrName: { width: 82, fontSize: 12, fontFamily: "'Cinzel', serif", color: C.parch },
@@ -879,6 +1184,7 @@ const S = {
   aiTag: { fontSize: 8, letterSpacing: 1, color: C.ink, background: C.goldHi, borderRadius: 4, padding: "1px 4px", marginLeft: 6, verticalAlign: "middle", fontFamily: "'Inter',sans-serif", fontWeight: 700 },
   questPct: { fontSize: 11, color: C.goldHi, fontWeight: 700 },
   questDesc: { fontSize: 11.5, color: C.dim, margin: "2px 0 6px" },
+  questFulfill: { fontSize: 10.5, padding: "5px 10px", borderRadius: 8 },
 
   trendGrid: { display: "flex", flexDirection: "column", gap: 10, marginTop: 14 },
   trendCard: { background: C.card, border: `1px solid ${C.line}`, borderRadius: 12, padding: "10px 12px 4px" },
@@ -911,17 +1217,38 @@ const S = {
   obs: { display: "flex", gap: 8, fontSize: 13, color: "#3A2C12", marginBottom: 7, lineHeight: 1.45 },
   bullet: { color: C.ember, fontSize: 9, marginTop: 4 },
   oQuest: { borderLeft: `2px solid ${C.ember}`, paddingLeft: 10, marginBottom: 9 },
+  oQuestRow: { display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10 },
   oQuestTitle: { fontFamily: "'Cinzel', serif", fontSize: 14, color: "#3A2C12", fontWeight: 700 },
   oQuestWhy: { fontSize: 12, color: "#6E5828" },
+  oQuestBtn: { flexShrink: 0, fontSize: 10.5, padding: "5px 10px", borderRadius: 8, border: `1px solid ${C.ember}`, color: "#3A2C12" },
   forecastNote: { marginTop: 14, paddingTop: 12, borderTop: "1px solid rgba(110,88,40,.3)", fontSize: 13, color: "#5A3D1A", fontWeight: 600 },
   oracleStamp: { marginTop: 10, fontSize: 10, color: "#8A7448", textAlign: "right" },
 
   field: { display: "flex", flexDirection: "column", gap: 6, marginBottom: 14, flex: 1 },
   fieldLabel: { fontSize: 11, letterSpacing: 1, textTransform: "uppercase", color: C.dim, marginBottom: 6 },
-  input: { background: C.ink2, border: `1px solid ${C.line}`, borderRadius: 8, padding: "10px 12px", color: C.parch, fontSize: 14, fontFamily: "'Inter', sans-serif", outline: "none", width: "100%", boxSizing: "border-box" },
+  input: { background: C.ink2, border: `1px solid ${C.line}`, borderRadius: 8, padding: "10px 12px", color: C.parch, fontSize: 14, fontFamily: "'Inter', sans-serif", outline: "none", width: "100%", boxSizing: "border-box", boxShadow: "inset 0 2px 4px rgba(0,0,0,.35)" },
   two: { display: "flex", gap: 12 },
   check: { display: "flex", alignItems: "center", gap: 8, fontSize: 13, color: C.parch, cursor: "pointer", marginBottom: 4 },
   actions: { display: "flex", gap: 10, marginTop: 18 },
+  unitSwitch: { fontSize: 11, padding: "6px 10px", marginBottom: 16, alignSelf: "flex-start" },
+
+  wizDots: { display: "flex", gap: 6, margin: "10px 0 4px" },
+  wizDot: { width: 20, height: 4, borderRadius: 2, border: `1px solid ${C.gold}`, transition: "background .2s" },
+
+  bgGrid: { display: "flex", flexDirection: "column", gap: 10, marginBottom: 16 },
+  bgCard: { textAlign: "left", background: C.ink2, border: `1px solid ${C.line}`, borderRadius: 10, padding: "12px 14px", cursor: "pointer", fontFamily: "'Inter', sans-serif" },
+  bgCardOn: { borderColor: C.gold, background: "rgba(200,169,110,.1)" },
+  bgLabel: { fontFamily: "'Cinzel', serif", fontSize: 14, color: C.parch, fontWeight: 700 },
+  bgDesc: { fontSize: 12, color: C.dim, margin: "3px 0 5px" },
+  bgBonus: { fontSize: 10.5, color: C.sage, fontWeight: 600, letterSpacing: 0.5 },
+
+  reviewCard: { background: `radial-gradient(120% 100% at 50% 0%, ${C.ink2}, ${C.ink})`, border: `1px solid ${C.gold}`, borderRadius: 16, padding: "22px 18px", textAlign: "center", marginTop: 8 },
+  reviewName: { fontFamily: "'Cinzel', serif", fontSize: 22, fontWeight: 700, color: C.goldHi, marginTop: 10 },
+  reviewSub: { fontSize: 12.5, color: C.dim, marginBottom: 16 },
+  reviewGrid: { display: "grid", gridTemplateColumns: "repeat(2, 1fr)", gap: 10 },
+  reviewStat: { background: C.card, border: `1px solid ${C.line}`, borderRadius: 10, padding: "9px 6px" },
+  reviewStatK: { fontSize: 9.5, letterSpacing: 1.5, textTransform: "uppercase", color: C.dim },
+  reviewStatV: { fontFamily: "'Cinzel', serif", fontSize: 14, color: C.parch, fontWeight: 700, marginTop: 3 },
   stepper: { display: "flex", alignItems: "center", border: `1px solid ${C.line}`, borderRadius: 8, overflow: "hidden", background: C.ink2 },
   stepBtn: { width: 40, height: 42, background: "transparent", border: "none", color: C.goldHi, fontSize: 20, cursor: "pointer" },
   stepVal: { flex: 1, textAlign: "center", fontSize: 16, fontWeight: 700, color: C.parch },
@@ -934,7 +1261,7 @@ const S = {
   seg: { flex: 1, padding: "7px 0", fontSize: 11, borderRadius: 7, border: `1px solid ${C.line}`, background: C.ink2, color: C.dim, cursor: "pointer", fontFamily: "'Inter',sans-serif" },
   segOn: { background: C.gold, color: C.ink, borderColor: C.gold, fontWeight: 700 },
 
-  btnPrimary: { background: `linear-gradient(135deg, ${C.ember}, #8E3A22)`, color: C.parch, border: `1px solid ${C.gold}`, padding: "13px 16px", borderRadius: 10, fontFamily: "'Cinzel', serif", fontSize: 13, letterSpacing: 1, cursor: "pointer", fontWeight: 600 },
+  btnPrimary: { background: `linear-gradient(135deg, ${C.ember}, #8E3A22)`, color: C.parch, border: `1px solid ${C.gold}`, padding: "13px 16px", borderRadius: 10, fontFamily: "'Cinzel', serif", fontSize: 13, letterSpacing: 1, cursor: "pointer", fontWeight: 600, boxShadow: "inset 0 1px 0 rgba(255,255,255,.15), 0 3px 8px rgba(0,0,0,.35)" },
   btnGhost: { background: "transparent", color: C.parch, border: `1px solid ${C.line}`, padding: "13px 16px", borderRadius: 10, fontFamily: "'Cinzel', serif", fontSize: 12, letterSpacing: 1, cursor: "pointer" },
 
   nav: { position: "sticky", bottom: 0, display: "flex", background: "rgba(19,16,11,.94)", borderTop: `1px solid ${C.line}`, backdropFilter: "blur(8px)" },
@@ -956,6 +1283,7 @@ const CSS = `
 .navbtn:active { transform: scale(.94); }
 .pinkey:hover { background: rgba(200,169,110,.12); }
 .pinkey:active { transform: scale(.94); }
+.bgcard:hover { border-color: ${C.gold}; }
 ::-webkit-scrollbar { width: 0; }
 @keyframes pinshake { 0%, 100% { transform: translateX(0); } 25% { transform: translateX(-8px); } 75% { transform: translateX(8px); } }
 @media (prefers-reduced-motion: reduce) { * { transition: none !important; animation: none !important; } }
