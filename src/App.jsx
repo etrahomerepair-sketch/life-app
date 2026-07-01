@@ -47,18 +47,21 @@ const MEAL_OPTS = [["healthy", "Healthy"], ["mixed", "Mixed"], ["junk", "Junk"],
    ===================================================================== */
 const MIMO_SYSTEM_PROMPT =
 `You are the LEDGER SCRIBE for an app called Life Ledger — a real-life tracker styled as an RPG.
-You receive a player's profile (including their chosen background/class and physical stats) and
-ONE new journal entry: structured fields plus a free-text note. This is a real person trying to
-actually improve their real life — take the job seriously. Read carefully and act like an active
-coach who's paying attention across entries, not a form validator.
+You receive a player's profile (background/class, physical stats, self-reported vices, and their
+own stated short-term and long-term goals) and ONE new journal entry: structured fields plus a
+free-text note. This is a real person trying to actually improve their real life — take the job
+seriously. Read carefully and act like an active coach who's paying attention across entries and
+who remembers what this specific person is trying to achieve, not a form validator.
 
 YOUR JOB
 1. Turn messy input into clean structured data the app's deterministic engine can use.
 2. Read the free-text note and EXTRACT anything notable not already in the fields
-   (money won/lost gambling, junk food, skipped workouts, illness, overtime, big purchases, etc).
-3. Propose ONE new quest when it's warranted — tailored to what the player actually wrote, not a
-   generic template. Prefer inventing something specific and a little evocative over skipping it,
-   especially if the note reveals a real struggle or goal worth naming.
+   (money won/lost gambling, junk food, skipped workouts, illness, overtime, big purchases, use of
+   any vice they listed, etc).
+3. Propose ONE new quest when it's warranted — tailored to what the player actually wrote AND to
+   their stated goals/vices when relevant, not a generic template. Prefer inventing something
+   specific and a little evocative over skipping it, especially if the note reveals a real struggle
+   or moves them toward (or away from) a goal they told you about.
 
 RULES
 - Never invent facts the entry doesn't support. If a field isn't implied, return null for it.
@@ -99,9 +102,12 @@ OUTPUT: respond with ONLY valid JSON, no markdown, no preamble, EXACTLY this sha
 
 const ORACLE_SYSTEM_PROMPT =
 `You are THE ORACLE inside Life Ledger — a wise, direct, genuinely invested life-coach voice.
-Read the player's profile (background/class, physical stats) + recent ledger and give grounded,
-specific wellbeing guidance. This person opted into an AI actively helping run their self-improvement
-— don't hedge into generic platitudes. Name the actual pattern you see and say what to do about it.
+Read the player's profile (background/class, physical stats, self-reported vices, their own stated
+short-term and long-term goals) + recent ledger and give grounded, specific wellbeing guidance.
+This person opted into an AI actively helping run their self-improvement — don't hedge into generic
+platitudes. Name the actual pattern you see and say what to do about it. Explicitly connect your
+reading and suggested quests back to the goals they told you about wherever it's honestly relevant —
+that's the whole point of asking.
 No medical diagnosis, no extreme regimens, never alarmist. Reward good habits; suggest concrete
 small steps tied to their real data, not generic advice that could apply to anyone.
 Respond with ONLY valid JSON, no markdown, exactly:
@@ -122,10 +128,17 @@ const cmToFtIn = (cm) => { const totalIn = (Number(cm) || 0) / 2.54; const ft = 
 const ftInToCm = (ft, inch) => Math.round(((Number(ft) || 0) * 12 + (Number(inch) || 0)) * 2.54);
 const kgToLb = (kg) => Math.round((Number(kg) || 0) * 2.20462);
 const lbToKg = (lb) => Math.round((Number(lb) || 0) / 2.20462);
-function formatHW(profile) {
-  if (profile.units === "metric") return `${profile.heightCm} cm · ${profile.weightKg} kg`;
-  const { ft, inch } = cmToFtIn(profile.heightCm);
-  return `${ft}'${inch}" · ${kgToLb(profile.weightKg)} lb`;
+// Height/weight are kept as separate raw fields per unit system (heightFt/heightIn/weightLb
+// vs heightCm/weightKg) so typing never round-trips through a lossy conversion — that trip
+// (e.g. lb -> kg -> lb on every keystroke) was rounding small values to 0 and fighting the
+// cursor. Conversion only happens when the user toggles units or when the form is saved.
+const heightDisplay = (p) => (p.units === "metric" ? `${p.heightCm} cm` : `${p.heightFt}'${p.heightIn}"`);
+const weightDisplay = (p) => (p.units === "metric" ? `${p.weightKg} kg` : `${p.weightLb} lb`);
+const formatHW = (p) => `${heightDisplay(p)} · ${weightDisplay(p)}`;
+function normalizeUnits(f) {
+  if (f.units === "imperial") return { ...f, heightCm: ftInToCm(f.heightFt, f.heightIn), weightKg: lbToKg(f.weightLb) };
+  const { ft, inch } = cmToFtIn(f.heightCm);
+  return { ...f, heightFt: ft, heightIn: inch, weightLb: kgToLb(f.weightKg) };
 }
 
 function dietFromMeals(meals) {
@@ -280,7 +293,11 @@ const backgroundLabel = (id) => CONFIG.backgrounds.find((b) => b.id === id)?.lab
 // Fires on EVERY entry.
 async function processEntry(profile, entry, ctx) {
   return callModel(MIMO_SYSTEM_PROMPT, {
-    profile: { name: profile.name, age: profile.age, sex: profile.sex, place: [profile.city, profile.country].filter(Boolean).join(", "), smoker: !!profile.smoker, background: backgroundLabel(profile.background), heightCm: profile.heightCm || null, weightKg: profile.weightKg || null },
+    profile: {
+      name: profile.name, age: profile.age, sex: profile.sex, place: [profile.city, profile.country].filter(Boolean).join(", "),
+      smoker: !!profile.smoker, background: backgroundLabel(profile.background), heightCm: profile.heightCm || null, weightKg: profile.weightKg || null,
+      vices: profile.vices || [], shortTermGoal: profile.shortGoal || null, longTermGoal: profile.longGoal || null,
+    },
     entry, recentTags: ctx.recentTags, activeQuestTitles: ctx.activeQuestTitles,
   });
 }
@@ -289,7 +306,10 @@ async function processEntry(profile, entry, ctx) {
 async function askOracle(profile, entries, d) {
   const ledger = entries.slice(0, 8).map((e) => ({ date: e.date, period: e.period, workouts: e.workouts, drinks: e.drinks, sleep: e.sleep, diet: e.diet, mood: e.mood, gambleLost: e.gambleLost, saved: (Number(e.earned) || 0) - (Number(e.spent) || 0), tags: e.tags }));
   return callModel(ORACLE_SYSTEM_PROMPT, {
-    profile: { name: profile.name, age: profile.age, sex: profile.sex, smoker: !!profile.smoker, background: backgroundLabel(profile.background) },
+    profile: {
+      name: profile.name, age: profile.age, sex: profile.sex, smoker: !!profile.smoker, background: backgroundLabel(profile.background),
+      vices: profile.vices || [], shortTermGoal: profile.shortGoal || null, longTermGoal: profile.longGoal || null,
+    },
     stats: { forecastYearsRemaining: d.forecast.remainingYears, potentialYearsRemaining: d.potential, attributes: d.attrs, gold: d.gold, streak: d.streak },
     recentHabitsWeekly: { workouts: round1(d.hab.workoutsWk), drinks: round1(d.hab.drinksWk), sleepHrs: round1(d.hab.sleep), diet1to5: round1(d.hab.diet), mood1to5: round1(d.hab.mood), gamblingLost: round1(d.hab.gambleLostWk) },
     ledger,
@@ -745,14 +765,23 @@ function Onboard({ initial, onSave, onCancel }) {
     : <CharacterCreation onSave={onSave} />;
 }
 
-const DEFAULT_HERO = { name: "", age: 30, sex: "male", country: "", city: "", birthplace: "", netWorth: 0, smoker: false, background: "drifter", units: "imperial", heightCm: 175, weightKg: 75 };
+const VICE_OPTIONS = ["Cigarettes", "Vaping / e-cigarettes", "Weed / cannabis", "Alcohol", "Gambling", "Junk food", "Energy drinks / heavy caffeine"];
+
+const DEFAULT_HERO = {
+  name: "", age: 30, sex: "male", country: "", city: "", birthplace: "",
+  netWorth: 0, background: "drifter",
+  units: "imperial", heightFt: 5, heightIn: 10, weightLb: 165, heightCm: 178, weightKg: 75,
+  vices: [], viceOther: "", shortGoal: "", longGoal: "",
+};
 
 /* ---------------------- Character Creation Wizard ------------------- */
 const WIZARD_STEPS = [
   { key: "prologue", title: "Prologue" },
   { key: "origins", title: "Origins" },
   { key: "body", title: "The Body" },
+  { key: "vices", title: "Vices & Habits" },
   { key: "path", title: "The Path" },
+  { key: "goals", title: "The Quest" },
   { key: "fortune", title: "Fortune" },
   { key: "review", title: "The Saga Begins" },
 ];
@@ -771,7 +800,11 @@ function CharacterCreation({ onSave }) {
   };
   const next = () => canNext() && setStep((s) => Math.min(s + 1, WIZARD_STEPS.length - 1));
   const back = () => setStep((s) => Math.max(s - 1, 0));
-  const finish = () => onSave({ ...f, age: Number(f.age), netWorth: Number(f.netWorth) || 0 });
+  const finish = () => {
+    const normalized = normalizeUnits(f);
+    const vices = f.viceOther.trim() ? [...f.vices, f.viceOther.trim()] : f.vices;
+    onSave({ ...normalized, vices, age: Number(f.age), netWorth: Number(f.netWorth) || 0, smoker: f.vices.includes("Cigarettes") || f.vices.includes("Vaping / e-cigarettes") });
+  };
 
   return (
     <div style={S.pad}>
@@ -779,7 +812,9 @@ function CharacterCreation({ onSave }) {
       {WIZARD_STEPS[step].key === "prologue" && <StepPrologue f={f} set={set} />}
       {WIZARD_STEPS[step].key === "origins" && <StepOrigins f={f} set={set} />}
       {WIZARD_STEPS[step].key === "body" && <StepBody f={f} set={set} />}
+      {WIZARD_STEPS[step].key === "vices" && <StepVices f={f} set={set} />}
       {WIZARD_STEPS[step].key === "path" && <StepPath f={f} set={set} />}
+      {WIZARD_STEPS[step].key === "goals" && <StepGoals f={f} set={set} />}
       {WIZARD_STEPS[step].key === "fortune" && <StepFortune f={f} set={set} />}
       {WIZARD_STEPS[step].key === "review" && <StepReview f={f} />}
       <div style={S.actions}>
@@ -824,9 +859,20 @@ function StepOrigins({ f, set }) {
   );
 }
 
+// Height/weight inputs for whichever unit system is active. Deliberately NOT
+// derived from the other system on every keystroke (that round-trip rounds
+// small values to 0 and fights the cursor) — toggling units converts once,
+// via normalizeUnits(), instead of on every render.
 function StepBody({ f, set }) {
   const imperial = f.units === "imperial";
-  const { ft, inch } = cmToFtIn(f.heightCm);
+  const toggleUnits = () => {
+    if (imperial) {
+      set("units", "metric"); set("heightCm", ftInToCm(f.heightFt, f.heightIn)); set("weightKg", lbToKg(f.weightLb));
+    } else {
+      const { ft, inch } = cmToFtIn(f.heightCm);
+      set("units", "imperial"); set("heightFt", ft); set("heightIn", inch); set("weightLb", kgToLb(f.weightKg));
+    }
+  };
   return (
     <>
       <p style={S.dim}>What do you carry into this world? These set your starting forecast — nothing here is judged, just recorded.</p>
@@ -842,20 +888,47 @@ function StepBody({ f, set }) {
         <div style={S.two}>
           <Field label="Height (ft / in)">
             <div style={{ display: "flex", gap: 8 }}>
-              <input className="inp" style={S.input} type="number" value={ft} onChange={(e) => set("heightCm", ftInToCm(e.target.value, inch))} />
-              <input className="inp" style={S.input} type="number" value={inch} onChange={(e) => set("heightCm", ftInToCm(ft, e.target.value))} />
+              <input className="inp" style={S.input} type="number" value={f.heightFt} onChange={(e) => set("heightFt", e.target.value)} />
+              <input className="inp" style={S.input} type="number" value={f.heightIn} onChange={(e) => set("heightIn", e.target.value)} />
             </div>
           </Field>
-          <Field label="Weight (lb)"><input className="inp" style={S.input} type="number" value={kgToLb(f.weightKg)} onChange={(e) => set("weightKg", lbToKg(e.target.value))} /></Field>
+          <Field label="Weight (lb)"><input className="inp" style={S.input} type="number" value={f.weightLb} onChange={(e) => set("weightLb", e.target.value)} /></Field>
         </div>
       ) : (
         <div style={S.two}>
-          <Field label="Height (cm)"><input className="inp" style={S.input} type="number" value={f.heightCm} onChange={(e) => set("heightCm", Number(e.target.value))} /></Field>
-          <Field label="Weight (kg)"><input className="inp" style={S.input} type="number" value={f.weightKg} onChange={(e) => set("weightKg", Number(e.target.value))} /></Field>
+          <Field label="Height (cm)"><input className="inp" style={S.input} type="number" value={f.heightCm} onChange={(e) => set("heightCm", e.target.value)} /></Field>
+          <Field label="Weight (kg)"><input className="inp" style={S.input} type="number" value={f.weightKg} onChange={(e) => set("weightKg", e.target.value)} /></Field>
         </div>
       )}
-      <button className="btn-ghost" style={S.unitSwitch} onClick={() => set("units", imperial ? "metric" : "imperial")}>Switch to {imperial ? "metric" : "imperial"}</button>
-      <label style={S.check}><input type="checkbox" checked={f.smoker} onChange={(e) => set("smoker", e.target.checked)} /><span>I smoke / use tobacco</span></label>
+      <button className="btn-ghost" style={S.unitSwitch} onClick={toggleUnits}>Switch to {imperial ? "metric" : "imperial"}</button>
+    </>
+  );
+}
+
+function StepVices({ f, set }) {
+  const toggle = (v) => set("vices", f.vices.includes(v) ? f.vices.filter((x) => x !== v) : [...f.vices, v]);
+  return (
+    <>
+      <p style={S.dim}>What do you carry that costs you? Check anything that applies — this shapes the Scribe's guidance, nothing else.</p>
+      <div style={S.viceGrid}>
+        {VICE_OPTIONS.map((v) => (
+          <label key={v} style={S.viceItem}>
+            <input type="checkbox" checked={f.vices.includes(v)} onChange={() => toggle(v)} />
+            <span>{v}</span>
+          </label>
+        ))}
+      </div>
+      <Field label="Anything else? (optional)"><input className="inp" style={S.input} value={f.viceOther} placeholder="e.g. doomscrolling, nicotine pouches" onChange={(e) => set("viceOther", e.target.value)} /></Field>
+    </>
+  );
+}
+
+function StepGoals({ f, set }) {
+  return (
+    <>
+      <p style={S.dim}>Every quest needs a destination. What are you actually working toward?</p>
+      <Field label="Short-term goal (weeks to months)"><textarea className="inp" style={{ ...S.input, minHeight: 64, resize: "vertical" }} value={f.shortGoal} placeholder="e.g. run a 5k, pay off a credit card" onChange={(e) => set("shortGoal", e.target.value)} /></Field>
+      <Field label="Long-term goal (the big one)"><textarea className="inp" style={{ ...S.input, minHeight: 64, resize: "vertical" }} value={f.longGoal} placeholder="e.g. buy a house, get healthy for good" onChange={(e) => set("longGoal", e.target.value)} /></Field>
     </>
   );
 }
@@ -888,10 +961,7 @@ function StepFortune({ f, set }) {
 
 function StepReview({ f }) {
   const bg = CONFIG.backgrounds.find((b) => b.id === f.background);
-  const imperial = f.units === "imperial";
-  const { ft, inch } = cmToFtIn(f.heightCm);
-  const heightDisplay = imperial ? `${ft}'${inch}"` : `${f.heightCm} cm`;
-  const weightDisplay = imperial ? `${kgToLb(f.weightKg)} lb` : `${f.weightKg} kg`;
+  const vices = f.viceOther.trim() ? [...f.vices, f.viceOther.trim()] : f.vices;
   return (
     <>
       <p style={S.dim}>Your saga is about to begin.</p>
@@ -901,11 +971,18 @@ function StepReview({ f }) {
         <div style={S.reviewSub}>{bg?.label} · {[f.city, f.country].filter(Boolean).join(", ") || "Unknown origin"}</div>
         <div style={S.reviewGrid}>
           <ReviewStat k="Age" v={f.age} />
-          <ReviewStat k="Height" v={heightDisplay} />
-          <ReviewStat k="Weight" v={weightDisplay} />
+          <ReviewStat k="Height" v={heightDisplay(f)} />
+          <ReviewStat k="Weight" v={weightDisplay(f)} />
           <ReviewStat k="Gold" v={fmtMoney(Number(f.netWorth) || 0)} />
         </div>
       </OrnateFrame>
+      {(vices.length > 0 || f.shortGoal || f.longGoal) && (
+        <div style={S.reviewNotes}>
+          {vices.length > 0 && <div style={S.reviewNoteLine}><b>Vices:</b> {vices.join(", ")}</div>}
+          {f.shortGoal && <div style={S.reviewNoteLine}><b>Short-term:</b> {f.shortGoal}</div>}
+          {f.longGoal && <div style={S.reviewNoteLine}><b>Long-term:</b> {f.longGoal}</div>}
+        </div>
+      )}
     </>
   );
 }
@@ -913,11 +990,23 @@ function ReviewStat({ k, v }) { return (<div style={S.reviewStat}><div style={S.
 
 /* ---------------------------- Edit Hero ------------------------------ */
 function EditHero({ initial, onSave, onCancel }) {
-  const [f, setF] = useState({ ...DEFAULT_HERO, ...initial });
+  const [f, setF] = useState({ ...DEFAULT_HERO, ...initial, viceOther: "" });
   const set = (k, v) => setF((s) => ({ ...s, [k]: v }));
+  const toggleVice = (v) => set("vices", f.vices.includes(v) ? f.vices.filter((x) => x !== v) : [...f.vices, v]);
   const valid = f.name.trim() && Number(f.age) > 0;
   const imperial = f.units === "imperial";
-  const { ft, inch } = cmToFtIn(f.heightCm);
+  const toggleUnits = () => {
+    if (imperial) {
+      set("units", "metric"); set("heightCm", ftInToCm(f.heightFt, f.heightIn)); set("weightKg", lbToKg(f.weightLb));
+    } else {
+      const { ft, inch } = cmToFtIn(f.heightCm);
+      set("units", "imperial"); set("heightFt", ft); set("heightIn", inch); set("weightLb", kgToLb(f.weightKg));
+    }
+  };
+  const save = () => {
+    const vices = f.viceOther.trim() ? [...f.vices, f.viceOther.trim()] : f.vices;
+    onSave({ ...f, vices, age: Number(f.age), netWorth: Number(f.netWorth) || 0, smoker: f.vices.includes("Cigarettes") || f.vices.includes("Vaping / e-cigarettes") });
+  };
   return (
     <div style={S.pad}>
       <div style={S.kicker}>Edit hero</div>
@@ -941,19 +1030,19 @@ function EditHero({ initial, onSave, onCancel }) {
         <div style={S.two}>
           <Field label="Height (ft / in)">
             <div style={{ display: "flex", gap: 8 }}>
-              <input className="inp" style={S.input} type="number" value={ft} onChange={(e) => set("heightCm", ftInToCm(e.target.value, inch))} />
-              <input className="inp" style={S.input} type="number" value={inch} onChange={(e) => set("heightCm", ftInToCm(ft, e.target.value))} />
+              <input className="inp" style={S.input} type="number" value={f.heightFt} onChange={(e) => set("heightFt", e.target.value)} />
+              <input className="inp" style={S.input} type="number" value={f.heightIn} onChange={(e) => set("heightIn", e.target.value)} />
             </div>
           </Field>
-          <Field label="Weight (lb)"><input className="inp" style={S.input} type="number" value={kgToLb(f.weightKg)} onChange={(e) => set("weightKg", lbToKg(e.target.value))} /></Field>
+          <Field label="Weight (lb)"><input className="inp" style={S.input} type="number" value={f.weightLb} onChange={(e) => set("weightLb", e.target.value)} /></Field>
         </div>
       ) : (
         <div style={S.two}>
-          <Field label="Height (cm)"><input className="inp" style={S.input} type="number" value={f.heightCm} onChange={(e) => set("heightCm", Number(e.target.value))} /></Field>
-          <Field label="Weight (kg)"><input className="inp" style={S.input} type="number" value={f.weightKg} onChange={(e) => set("weightKg", Number(e.target.value))} /></Field>
+          <Field label="Height (cm)"><input className="inp" style={S.input} type="number" value={f.heightCm} onChange={(e) => set("heightCm", e.target.value)} /></Field>
+          <Field label="Weight (kg)"><input className="inp" style={S.input} type="number" value={f.weightKg} onChange={(e) => set("weightKg", e.target.value)} /></Field>
         </div>
       )}
-      <button className="btn-ghost" style={S.unitSwitch} onClick={() => set("units", imperial ? "metric" : "imperial")}>Switch to {imperial ? "metric" : "imperial"}</button>
+      <button className="btn-ghost" style={S.unitSwitch} onClick={toggleUnits}>Switch to {imperial ? "metric" : "imperial"}</button>
       <div style={S.fieldLabel}>Background</div>
       <div style={S.bgGrid}>
         {CONFIG.backgrounds.map((b) => (
@@ -965,9 +1054,20 @@ function EditHero({ initial, onSave, onCancel }) {
         ))}
       </div>
       <Field label="Gold — savings / net worth ($)"><input className="inp" style={S.input} type="number" value={f.netWorth} onChange={(e) => set("netWorth", e.target.value)} /></Field>
-      <label style={S.check}><input type="checkbox" checked={f.smoker} onChange={(e) => set("smoker", e.target.checked)} /><span>I smoke / use tobacco</span></label>
+      <div style={S.fieldLabel}>Vices &amp; habits</div>
+      <div style={S.viceGrid}>
+        {VICE_OPTIONS.map((v) => (
+          <label key={v} style={S.viceItem}>
+            <input type="checkbox" checked={f.vices.includes(v)} onChange={() => toggleVice(v)} />
+            <span>{v}</span>
+          </label>
+        ))}
+      </div>
+      <Field label="Anything else? (optional)"><input className="inp" style={S.input} value={f.viceOther} onChange={(e) => set("viceOther", e.target.value)} /></Field>
+      <Field label="Short-term goal"><textarea className="inp" style={{ ...S.input, minHeight: 64, resize: "vertical" }} value={f.shortGoal} onChange={(e) => set("shortGoal", e.target.value)} /></Field>
+      <Field label="Long-term goal"><textarea className="inp" style={{ ...S.input, minHeight: 64, resize: "vertical" }} value={f.longGoal} onChange={(e) => set("longGoal", e.target.value)} /></Field>
       <div style={S.actions}>
-        <button className="btn-primary" style={{ ...S.btnPrimary, flex: 1, opacity: valid ? 1 : 0.5 }} disabled={!valid} onClick={() => onSave({ ...f, age: Number(f.age), netWorth: Number(f.netWorth) || 0 })}>Save</button>
+        <button className="btn-primary" style={{ ...S.btnPrimary, flex: 1, opacity: valid ? 1 : 0.5 }} disabled={!valid} onClick={save}>Save</button>
         {onCancel && <button className="btn-ghost" style={S.btnGhost} onClick={onCancel}>Cancel</button>}
       </div>
     </div>
@@ -1125,8 +1225,8 @@ const S = {
     background: `radial-gradient(120% 70% at 50% -10%, ${C.card} 0%, ${C.ink} 60%), radial-gradient(140% 90% at 50% 115%, rgba(0,0,0,.65), transparent)`,
   },
   frame: { width: "100%", maxWidth: 460, minHeight: "100vh", color: C.parch, fontFamily: "'Inter', system-ui, sans-serif", display: "flex", flexDirection: "column", position: "relative", boxShadow: "inset 0 0 80px rgba(0,0,0,.5)" },
-  scroll: { flex: 1, overflowY: "auto", paddingBottom: 86 },
-  pad: { padding: "22px 18px 8px" },
+  scroll: { flex: 1, overflowY: "auto", paddingBottom: 86, paddingTop: "env(safe-area-inset-top, 0px)" },
+  pad: { padding: "40px 18px 8px" },
   loading: { textAlign: "center", padding: "120px 0", color: C.dim, fontFamily: "'Cinzel', serif", letterSpacing: 1 },
   kicker: { fontFamily: "'Cinzel', serif", fontSize: 11, letterSpacing: 3, textTransform: "uppercase", color: C.gold },
   name: { fontFamily: "'Cinzel', serif", fontSize: 28, fontWeight: 700, margin: "2px 0 4px", color: C.parch, lineHeight: 1.05 },
@@ -1242,6 +1342,9 @@ const S = {
   bgDesc: { fontSize: 12, color: C.dim, margin: "3px 0 5px" },
   bgBonus: { fontSize: 10.5, color: C.sage, fontWeight: 600, letterSpacing: 0.5 },
 
+  viceGrid: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginBottom: 14 },
+  viceItem: { display: "flex", alignItems: "center", gap: 8, fontSize: 12.5, color: C.parch, cursor: "pointer" },
+
   reviewCard: { background: `radial-gradient(120% 100% at 50% 0%, ${C.ink2}, ${C.ink})`, border: `1px solid ${C.gold}`, borderRadius: 16, padding: "22px 18px", textAlign: "center", marginTop: 8 },
   reviewName: { fontFamily: "'Cinzel', serif", fontSize: 22, fontWeight: 700, color: C.goldHi, marginTop: 10 },
   reviewSub: { fontSize: 12.5, color: C.dim, marginBottom: 16 },
@@ -1249,6 +1352,8 @@ const S = {
   reviewStat: { background: C.card, border: `1px solid ${C.line}`, borderRadius: 10, padding: "9px 6px" },
   reviewStatK: { fontSize: 9.5, letterSpacing: 1.5, textTransform: "uppercase", color: C.dim },
   reviewStatV: { fontFamily: "'Cinzel', serif", fontSize: 14, color: C.parch, fontWeight: 700, marginTop: 3 },
+  reviewNotes: { marginTop: 14, display: "flex", flexDirection: "column", gap: 6 },
+  reviewNoteLine: { fontSize: 12, color: C.dim, lineHeight: 1.5 },
   stepper: { display: "flex", alignItems: "center", border: `1px solid ${C.line}`, borderRadius: 8, overflow: "hidden", background: C.ink2 },
   stepBtn: { width: 40, height: 42, background: "transparent", border: "none", color: C.goldHi, fontSize: 20, cursor: "pointer" },
   stepVal: { flex: 1, textAlign: "center", fontSize: 16, fontWeight: 700, color: C.parch },
