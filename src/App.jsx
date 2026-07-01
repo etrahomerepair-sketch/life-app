@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useMemo, useRef } from "react";
+import { supabase } from "./lib/supabaseClient";
 
 /* =====================================================================
    LIFE LEDGER  v3  —  AI-run life tracker (RPG character sheet)
@@ -255,22 +256,44 @@ async function askOracle(profile, entries, d) {
   });
 }
 
-/* ----------------------------- storage ----------------------------- */
-const KEY_P = "lifeledger3:profile", KEY_E = "lifeledger3:entries", KEY_O = "lifeledger3:oracle", KEY_Q = "lifeledger3:quests";
-/* Storage: uses the artifact's window.storage inside Claude's preview, and
-   falls back to localStorage on the real deployed site. Swap to Supabase for
-   multi-device (see BUILD.md — the calls are already async). */
-async function storeGet(k) {
-  try {
-    if (window.storage) { const r = await window.storage.get(k, false); return r ? JSON.parse(r.value) : null; }
-    const v = localStorage.getItem(k); return v ? JSON.parse(v) : null;
-  } catch { return null; }
+/* ----------------------------- storage -----------------------------
+   Supabase-backed, one row per hero keyed by auth.uid(). RLS on every
+   table means these calls only ever see the signed-in user's own rows. */
+const rowToProfile = (r) => !r ? null : ({ name: r.name || "", age: r.age, sex: r.sex, country: r.country, city: r.city, birthplace: r.birthplace, netWorth: Number(r.net_worth) || 0, smoker: !!r.smoker });
+const profileToRow = (p, uid) => ({ id: uid, name: p.name, age: p.age, sex: p.sex, country: p.country, city: p.city, birthplace: p.birthplace, net_worth: p.netWorth, smoker: !!p.smoker });
+const rowToEntry = (r) => ({ id: r.id, date: r.date, period: r.period, workouts: Number(r.workouts) || 0, drinks: Number(r.drinks) || 0, sleep: Number(r.sleep) || 0, meals: r.meals || {}, diet: Number(r.diet) || 0, mood: Number(r.mood) || 0, earned: Number(r.earned) || 0, spent: Number(r.spent) || 0, gambleWon: Number(r.gamble_won) || 0, gambleLost: Number(r.gamble_lost) || 0, tags: r.tags || [], ai: r.ai || { ok: false }, notes: r.notes || "" });
+const entryToRow = (e, uid) => ({ id: e.id, profile_id: uid, date: e.date, period: e.period, workouts: e.workouts, drinks: e.drinks, sleep: e.sleep, meals: e.meals, diet: e.diet, mood: e.mood, earned: e.earned, spent: e.spent, gamble_won: e.gambleWon, gamble_lost: e.gambleLost, tags: e.tags, ai: e.ai, notes: e.notes });
+const rowToQuest = (r) => ({ id: r.id, title: r.title, desc: r.desc, metric: r.metric, tag: r.tag, target: Number(r.target) || 0 });
+const questToRow = (q, uid) => ({ id: q.id, profile_id: uid, title: q.title, desc: q.desc, metric: q.metric, tag: q.tag || null, target: q.target });
+
+async function fetchProfile(uid) {
+  const { data } = await supabase.from("profiles").select("*").eq("id", uid).maybeSingle();
+  return rowToProfile(data);
 }
-async function storeSet(k, v) {
-  try {
-    if (window.storage) { await window.storage.set(k, JSON.stringify(v), false); return; }
-    localStorage.setItem(k, JSON.stringify(v));
-  } catch {}
+async function fetchEntries(uid) {
+  const { data } = await supabase.from("entries").select("*").eq("profile_id", uid).order("date", { ascending: false });
+  return (data || []).map(rowToEntry);
+}
+async function fetchQuests(uid) {
+  const { data } = await supabase.from("quests").select("*").eq("profile_id", uid).order("created_at", { ascending: false });
+  return (data || []).map(rowToQuest);
+}
+async function fetchOracle(uid) {
+  const { data } = await supabase.from("oracle").select("*").eq("profile_id", uid).maybeSingle();
+  return data ? { ...(data.data || {}), at: data.at } : null;
+}
+async function saveProfileRow(p, uid) { await supabase.from("profiles").upsert(profileToRow(p, uid)); }
+async function saveEntryRow(e, uid) { await supabase.from("entries").upsert(entryToRow(e, uid)); }
+async function deleteEntryRow(id) { await supabase.from("entries").delete().eq("id", id); }
+async function saveQuestRow(q, uid) { await supabase.from("quests").upsert(questToRow(q, uid)); }
+async function saveOracleRow(o, uid) { await supabase.from("oracle").upsert({ profile_id: uid, data: o, at: o.at || new Date().toISOString() }); }
+async function resetAllRows(uid) {
+  await Promise.all([
+    supabase.from("entries").delete().eq("profile_id", uid),
+    supabase.from("quests").delete().eq("profile_id", uid),
+    supabase.from("oracle").delete().eq("profile_id", uid),
+  ]);
+  await supabase.from("profiles").delete().eq("id", uid);
 }
 
 /* ----------------------------- palette ----------------------------- */
@@ -290,6 +313,7 @@ function useCount(target, ms = 900) {
 
 /* =================================================================== */
 export default function App() {
+  const [session, setSession] = useState(undefined); // undefined = checking, null = signed out
   const [loading, setLoading] = useState(true);
   const [profile, setProfile] = useState(null);
   const [entries, setEntries] = useState([]);
@@ -301,12 +325,21 @@ export default function App() {
   const [aiStatus, setAiStatus] = useState("checking"); // "checking" | "online" | "offline"
 
   useEffect(() => {
+    supabase.auth.getSession().then(({ data }) => setSession(data.session));
+    const { data: sub } = supabase.auth.onAuthStateChange((_event, sess) => setSession(sess));
+    return () => sub.subscription.unsubscribe();
+  }, []);
+
+  const uid = session?.user?.id;
+  useEffect(() => {
+    if (!uid) { setLoading(false); return; }
     (async () => {
-      const [p, e, o, q] = await Promise.all([storeGet(KEY_P), storeGet(KEY_E), storeGet(KEY_O), storeGet(KEY_Q)]);
-      if (p) setProfile(p); if (Array.isArray(e)) setEntries(e); if (o) setOracle(o); if (Array.isArray(q)) setDynQuests(q);
+      setLoading(true);
+      const [p, e, q, o] = await Promise.all([fetchProfile(uid), fetchEntries(uid), fetchQuests(uid), fetchOracle(uid)]);
+      setProfile(p); setEntries(e); setDynQuests(q); setOracle(o);
       setLoading(false);
     })();
-  }, []);
+  }, [uid]);
 
   // Cheap reachability check: a GET hits the function's method guard ("POST
   // only") before it ever calls MiMo, so this costs no AI tokens. Hosts with
@@ -320,10 +353,11 @@ export default function App() {
     return () => { cancelled = true; };
   }, []);
 
-  const saveProfile = (p) => { setProfile(p); storeSet(KEY_P, p); setEditing(false); setTab("hero"); };
-  const resetAll = () => { setProfile(null); setEntries([]); setOracle(null); setDynQuests([]); [KEY_P, KEY_E, KEY_O, KEY_Q].forEach((k) => storeSet(k, k === KEY_E || k === KEY_Q ? [] : null)); setEditing(false); };
-  const saveOracle = (o) => { setOracle(o); storeSet(KEY_O, o); };
-  const deleteEntry = (id) => { const n = entries.filter((e) => e.id !== id); setEntries(n); storeSet(KEY_E, n); };
+  const saveProfile = async (p) => { await saveProfileRow(p, uid); setProfile(p); setEditing(false); setTab("hero"); };
+  const resetAll = async () => { await resetAllRows(uid); setProfile(null); setEntries([]); setOracle(null); setDynQuests([]); setEditing(false); };
+  const saveOracle = async (o) => { await saveOracleRow(o, uid); setOracle(o); };
+  const deleteEntry = async (id) => { await deleteEntryRow(id); setEntries((prev) => prev.filter((e) => e.id !== id)); };
+  const signOut = () => supabase.auth.signOut();
 
   // The AI-on-every-entry pipeline.
   const addEntry = async (form) => {
@@ -351,14 +385,16 @@ export default function App() {
       // dynamic quest minting (dedupe by title, only allowed metrics)
       const nq = r.newQuest;
       if (nq && nq.title && CONFIG.questMetrics.includes(nq.metric) && !dynQuests.some((q) => q.title.toLowerCase() === nq.title.toLowerCase())) {
-        const next = [{ ...nq, id: "ai_" + Date.now(), createdAt: en.date }, ...dynQuests];
-        setDynQuests(next); storeSet(KEY_Q, next);
+        const minted = { ...nq, id: "ai_" + Date.now(), createdAt: en.date };
+        await saveQuestRow(minted, uid);
+        setDynQuests((prev) => [minted, ...prev]);
       }
     } catch (err) {
       en.ai = { ok: false, summary: "Saved without AI — " + (err && err.message ? err.message : "offline"), insight: "" };
     }
+    await saveEntryRow(en, uid);
     const next = [en, ...entries].sort((a, b) => new Date(b.date) - new Date(a.date));
-    setEntries(next); storeSet(KEY_E, next);
+    setEntries(next);
     setLastAI(en.ai); setTab("hero");
     return en.ai;
   };
@@ -386,15 +422,44 @@ export default function App() {
       <style>{CSS}</style>
       <div style={S.frame}>
         <div style={S.scroll}>
-          {loading ? <div style={S.loading}>Unrolling the ledger…</div>
+          {session === undefined ? <div style={S.loading}>Unrolling the ledger…</div>
+            : !session ? <AuthScreen />
+            : loading ? <div style={S.loading}>Unrolling the ledger…</div>
             : !profile || editing ? <Onboard initial={profile} onSave={saveProfile} onCancel={profile ? () => setEditing(false) : null} />
-            : tab === "hero" ? <Hero profile={profile} d={d} lastAI={lastAI} clearAI={() => setLastAI(null)} onEdit={() => setEditing(true)} onReset={resetAll} aiStatus={aiStatus} />
+            : tab === "hero" ? <Hero profile={profile} d={d} lastAI={lastAI} clearAI={() => setLastAI(null)} onEdit={() => setEditing(true)} onReset={resetAll} onSignOut={signOut} aiStatus={aiStatus} />
             : tab === "log" ? <LogEntry onAdd={addEntry} />
             : tab === "chronicle" ? <Chronicle entries={entries} d={d} onDelete={deleteEntry} />
             : <Oracle profile={profile} entries={entries} d={d} cached={oracle} onResult={saveOracle} />}
         </div>
-        {!loading && profile && !editing && <Nav tab={tab} setTab={setTab} />}
+        {session && !loading && profile && !editing && <Nav tab={tab} setTab={setTab} />}
       </div>
+    </div>
+  );
+}
+
+/* ------------------------------ AuthScreen -------------------------- */
+function AuthScreen() {
+  const [email, setEmail] = useState("");
+  const [status, setStatus] = useState("idle"); // idle | sending | sent | error
+  const [error, setError] = useState("");
+  const send = async () => {
+    setStatus("sending"); setError("");
+    const { error: err } = await supabase.auth.signInWithOtp({ email, options: { emailRedirectTo: window.location.origin } });
+    if (err) { setStatus("error"); setError(err.message); } else { setStatus("sent"); }
+  };
+  return (
+    <div style={S.pad}>
+      <div style={S.kicker}>Life Ledger</div>
+      <h1 style={S.name}>Sign in to begin</h1>
+      <p style={S.dim}>We'll email you a magic link — no password needed.</p>
+      <Field label="Email">
+        <input className="inp" style={S.input} type="email" value={email} placeholder="you@example.com" onChange={(e) => setEmail(e.target.value)} />
+      </Field>
+      <button className="btn-primary" style={{ ...S.btnPrimary, width: "100%", opacity: status === "sending" || !email ? 0.6 : 1 }} disabled={status === "sending" || !email} onClick={send}>
+        {status === "sending" ? "Sending…" : "Send magic link"}
+      </button>
+      {status === "sent" && <div style={{ ...S.dim, marginTop: 12, color: C.sage }}>✶ Check your email for the sign-in link.</div>}
+      {status === "error" && <div style={S.oracleErr}>{error}</div>}
     </div>
   );
 }
@@ -416,7 +481,7 @@ function Nav({ tab, setTab }) {
 }
 
 /* ------------------------------- Hero ------------------------------ */
-function Hero({ profile, d, lastAI, clearAI, onEdit, onReset, aiStatus }) {
+function Hero({ profile, d, lastAI, clearAI, onEdit, onReset, onSignOut, aiStatus }) {
   const { forecast, potential, attrs, gold, rank, deeds, streak, savingsRate, quests } = d;
   const [menu, setMenu] = useState(false);
   const lifeProgress = clamp(profile.age / forecast.estLifespan, 0, 1);
@@ -450,6 +515,7 @@ function Hero({ profile, d, lastAI, clearAI, onEdit, onReset, aiStatus }) {
       {menu && (
         <div style={S.menu}>
           <button className="menuItem" style={S.menuItem} onClick={() => { setMenu(false); onEdit(); }}>Edit hero</button>
+          <button className="menuItem" style={S.menuItem} onClick={() => { setMenu(false); onSignOut(); }}>Sign out</button>
           <button className="menuItem" style={{ ...S.menuItem, color: C.ember }} onClick={() => { setMenu(false); onReset(); }}>Start new game</button>
         </div>
       )}
