@@ -8,11 +8,11 @@ export default defineConfig({
     VitePWA({
       registerType: 'autoUpdate',
       manifest: {
-        name: 'Life App',
-        short_name: 'Life',
-        description: 'Your personal life management and AI coaching app',
-        theme_color: '#7c3aed',
-        background_color: '#0d0f17',
+        name: 'Life Ledger',
+        short_name: 'Ledger',
+        description: 'An AI-run life tracker styled as an RPG character sheet',
+        theme_color: '#13100B',
+        background_color: '#13100B',
         display: 'standalone',
         orientation: 'portrait',
         start_url: '/',

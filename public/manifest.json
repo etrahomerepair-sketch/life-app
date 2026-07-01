@@ -1,11 +1,11 @@
 {
-  "name": "Life App",
-  "short_name": "Life",
-  "description": "Your personal life management and AI coaching app",
+  "name": "Life Ledger",
+  "short_name": "Ledger",
+  "description": "An AI-run life tracker styled as an RPG character sheet",
   "start_url": "/",
   "display": "standalone",
-  "background_color": "#0d0f17",
-  "theme_color": "#7c3aed",
+  "background_color": "#13100B",
+  "theme_color": "#13100B",
   "orientation": "portrait",
   "icons": [
     { "src": "/icon-192.png", "sizes": "192x192", "type": "image/png" },

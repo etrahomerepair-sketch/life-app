@@ -30,6 +30,7 @@ export const handler = async (event) => {
       },
       body: JSON.stringify({
         model: MODEL, max_tokens: 1000, temperature: 0.4,
+        chat_template_kwargs: { enable_thinking: false },
         messages: [
           { role: "system", content: system },
           { role: "user", content: typeof input === "string" ? input : JSON.stringify(input) },
