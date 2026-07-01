@@ -444,7 +444,10 @@ export default function App() {
     try {
       result = await processEntry(profile, { date: snapshot.date, period: snapshot.period, workouts: snapshot.workouts, drinks: snapshot.drinks, sleep: snapshot.sleep, meals: snapshot.meals, dietScore: snapshot.diet, mood: snapshot.mood, earned: num(snapshot.earned), spent: num(snapshot.spent), note: note || "" }, ctx);
     } catch (err) {
-      aiOffline = { ok: false, summary: (note ? "Saved without AI — " : "Scribe offline — ") + (err && err.message ? err.message : "offline"), insight: "" };
+      // Toast headers already say "offline"/"saved without AI" — keep this to
+      // the raw detail so it doesn't repeat itself (e.g. "Scribe offline" /
+      // "Scribe offline — Scribe offline — proxy HTTP 504").
+      aiOffline = { ok: false, summary: (err && err.message) || "connection failed", insight: "" };
     }
 
     let finalAi = aiOffline;
@@ -1159,7 +1162,6 @@ function QuickLog({ today, profile, onQuickUpdate, onJournal, lastAI, clearAI })
   const setSleep = (v) => { onQuickUpdate({ sleep: v }); flash("sleep"); };
   const setWorkouts = (v) => { onQuickUpdate({ workouts: v }); flash("workouts"); };
   const setDrinks = (v) => { onQuickUpdate({ drinks: v }); flash("drinks"); };
-  const setMood = (v) => { onQuickUpdate({ mood: v }); flash("mood"); };
 
   const [moneyAmt, setMoneyAmt] = useState("");
   const [moneyType, setMoneyType] = useState("spent");
@@ -1219,10 +1221,6 @@ function QuickLog({ today, profile, onQuickUpdate, onJournal, lastAI, clearAI })
         <Slider label="Hours" value={t.sleep || 7} min={3} max={12} step={0.5} suffix="h" onChange={setSleep} />
       </QuickCard>
 
-      <QuickCard title="Mood right now" saved={flashKey === "mood"}>
-        <MoodPicker value={t.mood} onChange={setMood} />
-      </QuickCard>
-
       <div style={S.two}>
         <QuickCard title="Workouts" saved={flashKey === "workouts"} compact>
           <Stepper label="Today" value={t.workouts || 0} onChange={setWorkouts} max={10} />
@@ -1276,17 +1274,6 @@ function QuickCard({ title, children, saved, compact }) {
         {saved && <span style={S.quickSaved}>✓ saved</span>}
       </div>
       {children}
-    </div>
-  );
-}
-
-function MoodPicker({ value, onChange }) {
-  const faces = [["1", "😞"], ["2", "🙁"], ["3", "😐"], ["4", "🙂"], ["5", "😄"]];
-  return (
-    <div style={S.moodRow}>
-      {faces.map(([v, emoji]) => (
-        <button key={v} className="moodbtn" style={{ ...S.moodBtn, ...(Number(value) === Number(v) ? S.moodBtnOn : {}) }} onClick={() => onChange(Number(v))}>{emoji}</button>
-      ))}
     </div>
   );
 }
@@ -1540,9 +1527,6 @@ const S = {
   quickAddRow: { display: "flex", gap: 8, marginTop: 10 },
   quickAddBtn: { padding: "0 16px", fontSize: 12 },
   quickTotal: { fontSize: 11, color: C.dim, marginTop: 8 },
-  moodRow: { display: "flex", justifyContent: "space-between", gap: 6 },
-  moodBtn: { flex: 1, fontSize: 24, padding: "8px 0", borderRadius: 10, border: `1px solid ${C.line}`, background: C.ink2, cursor: "pointer" },
-  moodBtnOn: { borderColor: C.gold, background: "rgba(200,169,110,.15)" },
 
   btnPrimary: { background: `linear-gradient(135deg, ${C.ember}, #8E3A22)`, color: C.parch, border: `1px solid ${C.gold}`, padding: "13px 16px", borderRadius: 10, fontFamily: "'Cinzel', serif", fontSize: 13, letterSpacing: 1, cursor: "pointer", fontWeight: 600, boxShadow: "inset 0 1px 0 rgba(255,255,255,.15), 0 3px 8px rgba(0,0,0,.35)" },
   btnGhost: { background: "transparent", color: C.parch, border: `1px solid ${C.line}`, padding: "13px 16px", borderRadius: 10, fontFamily: "'Cinzel', serif", fontSize: 12, letterSpacing: 1, cursor: "pointer" },
@@ -1567,8 +1551,6 @@ const CSS = `
 .pinkey:hover { background: rgba(200,169,110,.12); }
 .pinkey:active { transform: scale(.94); }
 .bgcard:hover { border-color: ${C.gold}; }
-.moodbtn:hover { border-color: ${C.gold}; }
-.moodbtn:active { transform: scale(.92); }
 ::-webkit-scrollbar { width: 0; }
 @keyframes pinshake { 0%, 100% { transform: translateX(0); } 25% { transform: translateX(-8px); } 75% { transform: translateX(8px); } }
 @media (prefers-reduced-motion: reduce) { * { transition: none !important; animation: none !important; } }
