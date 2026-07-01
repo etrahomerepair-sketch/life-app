@@ -298,6 +298,7 @@ export default function App() {
   const [tab, setTab] = useState("hero");
   const [editing, setEditing] = useState(false);
   const [lastAI, setLastAI] = useState(null); // {summary, insight, ok} for a quick toast
+  const [aiStatus, setAiStatus] = useState("checking"); // "checking" | "online" | "offline"
 
   useEffect(() => {
     (async () => {
@@ -305,6 +306,18 @@ export default function App() {
       if (p) setProfile(p); if (Array.isArray(e)) setEntries(e); if (o) setOracle(o); if (Array.isArray(q)) setDynQuests(q);
       setLoading(false);
     })();
+  }, []);
+
+  // Cheap reachability check: a GET hits the function's method guard ("POST
+  // only") before it ever calls MiMo, so this costs no AI tokens. Hosts with
+  // no functions dir (or SPA fallback) won't return that exact body.
+  useEffect(() => {
+    let cancelled = false;
+    fetch(AI.mimoProxyUrl, { method: "GET" })
+      .then((r) => r.text())
+      .then((t) => { if (!cancelled) setAiStatus(t.trim() === "POST only" ? "online" : "offline"); })
+      .catch(() => { if (!cancelled) setAiStatus("offline"); });
+    return () => { cancelled = true; };
   }, []);
 
   const saveProfile = (p) => { setProfile(p); storeSet(KEY_P, p); setEditing(false); setTab("hero"); };
@@ -375,7 +388,7 @@ export default function App() {
         <div style={S.scroll}>
           {loading ? <div style={S.loading}>Unrolling the ledger…</div>
             : !profile || editing ? <Onboard initial={profile} onSave={saveProfile} onCancel={profile ? () => setEditing(false) : null} />
-            : tab === "hero" ? <Hero profile={profile} d={d} lastAI={lastAI} clearAI={() => setLastAI(null)} onEdit={() => setEditing(true)} onReset={resetAll} />
+            : tab === "hero" ? <Hero profile={profile} d={d} lastAI={lastAI} clearAI={() => setLastAI(null)} onEdit={() => setEditing(true)} onReset={resetAll} aiStatus={aiStatus} />
             : tab === "log" ? <LogEntry onAdd={addEntry} />
             : tab === "chronicle" ? <Chronicle entries={entries} d={d} onDelete={deleteEntry} />
             : <Oracle profile={profile} entries={entries} d={d} cached={oracle} onResult={saveOracle} />}
@@ -403,7 +416,7 @@ function Nav({ tab, setTab }) {
 }
 
 /* ------------------------------- Hero ------------------------------ */
-function Hero({ profile, d, lastAI, clearAI, onEdit, onReset }) {
+function Hero({ profile, d, lastAI, clearAI, onEdit, onReset, aiStatus }) {
   const { forecast, potential, attrs, gold, rank, deeds, streak, savingsRate, quests } = d;
   const [menu, setMenu] = useState(false);
   const lifeProgress = clamp(profile.age / forecast.estLifespan, 0, 1);
@@ -429,7 +442,10 @@ function Hero({ profile, d, lastAI, clearAI, onEdit, onReset }) {
             <div style={S.subline}>Lv {profile.age} · {rank.current.name} · {profile.city || profile.country || "the realm"}</div>
           </div>
         </div>
-        <button className="gear" style={S.gear} onClick={() => setMenu((m) => !m)}>⚙</button>
+        <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+          <StatusPill status={aiStatus} />
+          <button className="gear" style={S.gear} onClick={() => setMenu((m) => !m)}>⚙</button>
+        </div>
       </header>
       {menu && (
         <div style={S.menu}>
@@ -636,6 +652,20 @@ function LogEntry({ onAdd }) {
 }
 
 /* --------------------------- small parts --------------------------- */
+function StatusPill({ status }) {
+  const map = {
+    checking: { label: "Checking…", color: C.dim },
+    online: { label: "AI connected", color: C.sage },
+    offline: { label: "AI offline", color: C.ember },
+  };
+  const s = map[status] || map.checking;
+  return (
+    <span style={{ ...S.statusPill, color: s.color, borderColor: s.color }}>
+      <span style={{ ...S.statusDot, background: s.color }} />
+      {s.label}
+    </span>
+  );
+}
 function Section({ title, children }) { return (<section style={S.section}><h2 style={S.h2}>{title}</h2>{children}</section>); }
 function Field({ label, children }) { return (<label style={S.field}><span style={S.fieldLabel}>{label}</span>{children}</label>); }
 function Stat({ k, v, accent }) { return (<div style={S.sStat}><span style={S.sStatK}>{k}</span><span style={{ ...S.sStatV, color: accent ? C.sage : C.parch }}>{v}</span></div>); }
@@ -706,6 +736,8 @@ const S = {
   topbar: { display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 14 },
   crestWrap: { display: "flex", gap: 12, alignItems: "center" },
   gear: { background: "none", border: "none", color: C.dim, fontSize: 20, cursor: "pointer", padding: 4 },
+  statusPill: { display: "inline-flex", alignItems: "center", gap: 5, fontSize: 10, letterSpacing: 0.5, border: "1px solid", borderRadius: 20, padding: "3px 8px", whiteSpace: "nowrap" },
+  statusDot: { width: 6, height: 6, borderRadius: "50%", flexShrink: 0 },
   menu: { position: "absolute", right: 18, marginTop: -6, background: C.card, border: `1px solid ${C.line}`, borderRadius: 10, overflow: "hidden", zIndex: 5, boxShadow: "0 8px 24px rgba(0,0,0,.5)" },
   menuItem: { display: "block", width: 160, textAlign: "left", padding: "11px 14px", background: "none", border: "none", color: C.parch, fontSize: 13, cursor: "pointer" },
 
