@@ -1,5 +1,4 @@
 import React, { useState, useEffect, useMemo, useRef } from "react";
-import { supabase } from "./lib/supabaseClient";
 
 /* =====================================================================
    LIFE LEDGER  v3  —  AI-run life tracker (RPG character sheet)
@@ -256,44 +255,31 @@ async function askOracle(profile, entries, d) {
   });
 }
 
-/* ----------------------------- storage -----------------------------
-   Supabase-backed, one row per hero keyed by auth.uid(). RLS on every
-   table means these calls only ever see the signed-in user's own rows. */
-const rowToProfile = (r) => !r ? null : ({ name: r.name || "", age: r.age, sex: r.sex, country: r.country, city: r.city, birthplace: r.birthplace, netWorth: Number(r.net_worth) || 0, smoker: !!r.smoker });
-const profileToRow = (p, uid) => ({ id: uid, name: p.name, age: p.age, sex: p.sex, country: p.country, city: p.city, birthplace: p.birthplace, net_worth: p.netWorth, smoker: !!p.smoker });
-const rowToEntry = (r) => ({ id: r.id, date: r.date, period: r.period, workouts: Number(r.workouts) || 0, drinks: Number(r.drinks) || 0, sleep: Number(r.sleep) || 0, meals: r.meals || {}, diet: Number(r.diet) || 0, mood: Number(r.mood) || 0, earned: Number(r.earned) || 0, spent: Number(r.spent) || 0, gambleWon: Number(r.gamble_won) || 0, gambleLost: Number(r.gamble_lost) || 0, tags: r.tags || [], ai: r.ai || { ok: false }, notes: r.notes || "" });
-const entryToRow = (e, uid) => ({ id: e.id, profile_id: uid, date: e.date, period: e.period, workouts: e.workouts, drinks: e.drinks, sleep: e.sleep, meals: e.meals, diet: e.diet, mood: e.mood, earned: e.earned, spent: e.spent, gamble_won: e.gambleWon, gamble_lost: e.gambleLost, tags: e.tags, ai: e.ai, notes: e.notes });
-const rowToQuest = (r) => ({ id: r.id, title: r.title, desc: r.desc, metric: r.metric, tag: r.tag, target: Number(r.target) || 0 });
-const questToRow = (q, uid) => ({ id: q.id, profile_id: uid, title: q.title, desc: q.desc, metric: q.metric, tag: q.tag || null, target: q.target });
+/* ----------------------------- storage ----------------------------- */
+const KEY_P = "lifeledger3:profile", KEY_E = "lifeledger3:entries", KEY_O = "lifeledger3:oracle", KEY_Q = "lifeledger3:quests";
+/* Storage: uses the artifact's window.storage inside Claude's preview, and
+   falls back to localStorage on the real deployed site. Swap to Supabase for
+   multi-device (see BUILD.md — the calls are already async). */
+async function storeGet(k) {
+  try {
+    if (window.storage) { const r = await window.storage.get(k, false); return r ? JSON.parse(r.value) : null; }
+    const v = localStorage.getItem(k); return v ? JSON.parse(v) : null;
+  } catch { return null; }
+}
+async function storeSet(k, v) {
+  try {
+    if (window.storage) { await window.storage.set(k, JSON.stringify(v), false); return; }
+    localStorage.setItem(k, JSON.stringify(v));
+  } catch {}
+}
 
-async function fetchProfile(uid) {
-  const { data } = await supabase.from("profiles").select("*").eq("id", uid).maybeSingle();
-  return rowToProfile(data);
-}
-async function fetchEntries(uid) {
-  const { data } = await supabase.from("entries").select("*").eq("profile_id", uid).order("date", { ascending: false });
-  return (data || []).map(rowToEntry);
-}
-async function fetchQuests(uid) {
-  const { data } = await supabase.from("quests").select("*").eq("profile_id", uid).order("created_at", { ascending: false });
-  return (data || []).map(rowToQuest);
-}
-async function fetchOracle(uid) {
-  const { data } = await supabase.from("oracle").select("*").eq("profile_id", uid).maybeSingle();
-  return data ? { ...(data.data || {}), at: data.at } : null;
-}
-async function saveProfileRow(p, uid) { await supabase.from("profiles").upsert(profileToRow(p, uid)); }
-async function saveEntryRow(e, uid) { await supabase.from("entries").upsert(entryToRow(e, uid)); }
-async function deleteEntryRow(id) { await supabase.from("entries").delete().eq("id", id); }
-async function saveQuestRow(q, uid) { await supabase.from("quests").upsert(questToRow(q, uid)); }
-async function saveOracleRow(o, uid) { await supabase.from("oracle").upsert({ profile_id: uid, data: o, at: o.at || new Date().toISOString() }); }
-async function resetAllRows(uid) {
-  await Promise.all([
-    supabase.from("entries").delete().eq("profile_id", uid),
-    supabase.from("quests").delete().eq("profile_id", uid),
-    supabase.from("oracle").delete().eq("profile_id", uid),
-  ]);
-  await supabase.from("profiles").delete().eq("id", uid);
+/* ----------------------------- PIN lock -----------------------------
+   Device-local gate only — not real auth. Everything still lives in
+   this browser's storage; the PIN just keeps a casual passerby out. */
+const KEY_PIN = "lifeledger3:pinHash";
+async function sha256Hex(text) {
+  const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text));
+  return Array.from(new Uint8Array(buf)).map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
 /* ----------------------------- palette ----------------------------- */
@@ -313,7 +299,6 @@ function useCount(target, ms = 900) {
 
 /* =================================================================== */
 export default function App() {
-  const [session, setSession] = useState(undefined); // undefined = checking, null = signed out
   const [loading, setLoading] = useState(true);
   const [profile, setProfile] = useState(null);
   const [entries, setEntries] = useState([]);
@@ -323,23 +308,20 @@ export default function App() {
   const [editing, setEditing] = useState(false);
   const [lastAI, setLastAI] = useState(null); // {summary, insight, ok} for a quick toast
   const [aiStatus, setAiStatus] = useState("checking"); // "checking" | "online" | "offline"
+  const [pinHash, setPinHash] = useState(undefined); // undefined = checking, null = none set yet
+  const [unlocked, setUnlocked] = useState(false);
 
   useEffect(() => {
-    supabase.auth.getSession().then(({ data }) => setSession(data.session));
-    const { data: sub } = supabase.auth.onAuthStateChange((_event, sess) => setSession(sess));
-    return () => sub.subscription.unsubscribe();
+    (async () => { setPinHash((await storeGet(KEY_PIN)) || null); })();
   }, []);
 
-  const uid = session?.user?.id;
   useEffect(() => {
-    if (!uid) { setLoading(false); return; }
     (async () => {
-      setLoading(true);
-      const [p, e, q, o] = await Promise.all([fetchProfile(uid), fetchEntries(uid), fetchQuests(uid), fetchOracle(uid)]);
-      setProfile(p); setEntries(e); setDynQuests(q); setOracle(o);
+      const [p, e, o, q] = await Promise.all([storeGet(KEY_P), storeGet(KEY_E), storeGet(KEY_O), storeGet(KEY_Q)]);
+      if (p) setProfile(p); if (Array.isArray(e)) setEntries(e); if (o) setOracle(o); if (Array.isArray(q)) setDynQuests(q);
       setLoading(false);
     })();
-  }, [uid]);
+  }, []);
 
   // Cheap reachability check: a GET hits the function's method guard ("POST
   // only") before it ever calls MiMo, so this costs no AI tokens. Hosts with
@@ -353,11 +335,13 @@ export default function App() {
     return () => { cancelled = true; };
   }, []);
 
-  const saveProfile = async (p) => { await saveProfileRow(p, uid); setProfile(p); setEditing(false); setTab("hero"); };
-  const resetAll = async () => { await resetAllRows(uid); setProfile(null); setEntries([]); setOracle(null); setDynQuests([]); setEditing(false); };
-  const saveOracle = async (o) => { await saveOracleRow(o, uid); setOracle(o); };
-  const deleteEntry = async (id) => { await deleteEntryRow(id); setEntries((prev) => prev.filter((e) => e.id !== id)); };
-  const signOut = () => supabase.auth.signOut();
+  const lock = () => setUnlocked(false);
+  const changePin = () => { storeSet(KEY_PIN, null); setPinHash(null); setUnlocked(false); };
+
+  const saveProfile = (p) => { setProfile(p); storeSet(KEY_P, p); setEditing(false); setTab("hero"); };
+  const resetAll = () => { setProfile(null); setEntries([]); setOracle(null); setDynQuests([]); [KEY_P, KEY_E, KEY_O, KEY_Q].forEach((k) => storeSet(k, k === KEY_E || k === KEY_Q ? [] : null)); setEditing(false); };
+  const saveOracle = (o) => { setOracle(o); storeSet(KEY_O, o); };
+  const deleteEntry = (id) => { const n = entries.filter((e) => e.id !== id); setEntries(n); storeSet(KEY_E, n); };
 
   // The AI-on-every-entry pipeline.
   const addEntry = async (form) => {
@@ -385,16 +369,14 @@ export default function App() {
       // dynamic quest minting (dedupe by title, only allowed metrics)
       const nq = r.newQuest;
       if (nq && nq.title && CONFIG.questMetrics.includes(nq.metric) && !dynQuests.some((q) => q.title.toLowerCase() === nq.title.toLowerCase())) {
-        const minted = { ...nq, id: "ai_" + Date.now(), createdAt: en.date };
-        await saveQuestRow(minted, uid);
-        setDynQuests((prev) => [minted, ...prev]);
+        const next = [{ ...nq, id: "ai_" + Date.now(), createdAt: en.date }, ...dynQuests];
+        setDynQuests(next); storeSet(KEY_Q, next);
       }
     } catch (err) {
       en.ai = { ok: false, summary: "Saved without AI — " + (err && err.message ? err.message : "offline"), insight: "" };
     }
-    await saveEntryRow(en, uid);
     const next = [en, ...entries].sort((a, b) => new Date(b.date) - new Date(a.date));
-    setEntries(next);
+    setEntries(next); storeSet(KEY_E, next);
     setLastAI(en.ai); setTab("hero");
     return en.ai;
   };
@@ -422,46 +404,99 @@ export default function App() {
       <style>{CSS}</style>
       <div style={S.frame}>
         <div style={S.scroll}>
-          {session === undefined ? <div style={S.loading}>Unrolling the ledger…</div>
-            : !session ? <AuthScreen />
+          {pinHash === undefined ? <div style={S.loading}>Unrolling the ledger…</div>
+            : !pinHash ? <PinSetup onSet={async (hash) => { await storeSet(KEY_PIN, hash); setPinHash(hash); setUnlocked(true); }} />
+            : !unlocked ? <PinLock expected={pinHash} onUnlock={() => setUnlocked(true)} />
             : loading ? <div style={S.loading}>Unrolling the ledger…</div>
             : !profile || editing ? <Onboard initial={profile} onSave={saveProfile} onCancel={profile ? () => setEditing(false) : null} />
-            : tab === "hero" ? <Hero profile={profile} d={d} lastAI={lastAI} clearAI={() => setLastAI(null)} onEdit={() => setEditing(true)} onReset={resetAll} onSignOut={signOut} aiStatus={aiStatus} />
+            : tab === "hero" ? <Hero profile={profile} d={d} lastAI={lastAI} clearAI={() => setLastAI(null)} onEdit={() => setEditing(true)} onReset={resetAll} onLock={lock} onChangePin={changePin} aiStatus={aiStatus} />
             : tab === "log" ? <LogEntry onAdd={addEntry} />
             : tab === "chronicle" ? <Chronicle entries={entries} d={d} onDelete={deleteEntry} />
             : <Oracle profile={profile} entries={entries} d={d} cached={oracle} onResult={saveOracle} />}
         </div>
-        {session && !loading && profile && !editing && <Nav tab={tab} setTab={setTab} />}
+        {pinHash && unlocked && !loading && profile && !editing && <Nav tab={tab} setTab={setTab} />}
       </div>
     </div>
   );
 }
 
-/* ------------------------------ AuthScreen -------------------------- */
-function AuthScreen() {
-  const [email, setEmail] = useState("");
-  const [status, setStatus] = useState("idle"); // idle | sending | sent | error
-  const [error, setError] = useState("");
-  const send = async () => {
-    setStatus("sending"); setError("");
-    const { error: err } = await supabase.auth.signInWithOtp({ email, options: { emailRedirectTo: window.location.origin } });
-    if (err) { setStatus("error"); setError(err.message); } else { setStatus("sent"); }
-  };
+/* ------------------------------- PIN -------------------------------- */
+function PinPad({ title, subtitle, value, onDigit, onBackspace, error, shake }) {
+  const keys = ["1", "2", "3", "4", "5", "6", "7", "8", "9", "", "0", "⌫"];
   return (
     <div style={S.pad}>
       <div style={S.kicker}>Life Ledger</div>
-      <h1 style={S.name}>Sign in to begin</h1>
-      <p style={S.dim}>We'll email you a magic link — no password needed.</p>
-      <Field label="Email">
-        <input className="inp" style={S.input} type="email" value={email} placeholder="you@example.com" onChange={(e) => setEmail(e.target.value)} />
-      </Field>
-      <button className="btn-primary" style={{ ...S.btnPrimary, width: "100%", opacity: status === "sending" || !email ? 0.6 : 1 }} disabled={status === "sending" || !email} onClick={send}>
-        {status === "sending" ? "Sending…" : "Send magic link"}
-      </button>
-      {status === "sent" && <div style={{ ...S.dim, marginTop: 12, color: C.sage }}>✶ Check your email for the sign-in link.</div>}
-      {status === "error" && <div style={S.oracleErr}>{error}</div>}
+      <h1 style={S.name}>{title}</h1>
+      <p style={S.dim}>{subtitle}</p>
+      <div style={{ ...S.pinDots, ...(shake ? { animation: "pinshake .4s" } : {}) }}>
+        {[0, 1, 2, 3].map((i) => <span key={i} style={{ ...S.pinDot, background: i < value.length ? C.goldHi : "transparent" }} />)}
+      </div>
+      {error ? <div style={S.pinError}>{error}</div> : null}
+      <div style={S.pinGrid}>
+        {keys.map((k, i) => k === "" ? <span key={i} /> : (
+          <button key={i} className="pinkey" style={S.pinKey} onClick={() => (k === "⌫" ? onBackspace() : onDigit(k))}>{k}</button>
+        ))}
+      </div>
     </div>
   );
+}
+
+function PinSetup({ onSet }) {
+  const [stage, setStage] = useState("enter"); // enter | confirm
+  const [pin, setPin] = useState("");
+  const [confirmPin, setConfirmPin] = useState("");
+  const [error, setError] = useState("");
+
+  const digit = (d) => {
+    if (stage === "enter") {
+      const next = (pin + d).slice(0, 4);
+      setPin(next);
+      if (next.length === 4) setTimeout(() => setStage("confirm"), 150);
+    } else {
+      const next = (confirmPin + d).slice(0, 4);
+      setConfirmPin(next);
+      if (next.length === 4) {
+        setTimeout(async () => {
+          if (next === pin) { onSet(await sha256Hex(pin)); }
+          else { setError("Didn't match — try again"); setPin(""); setConfirmPin(""); setStage("enter"); }
+        }, 150);
+      }
+    }
+  };
+  const backspace = () => (stage === "enter" ? setPin((p) => p.slice(0, -1)) : setConfirmPin((p) => p.slice(0, -1)));
+
+  return (
+    <PinPad
+      title={stage === "enter" ? "Set a PIN" : "Confirm PIN"}
+      subtitle={stage === "enter" ? "Choose 4 digits to guard your ledger." : "Enter it once more."}
+      value={stage === "enter" ? pin : confirmPin}
+      onDigit={digit}
+      onBackspace={backspace}
+      error={error}
+    />
+  );
+}
+
+function PinLock({ expected, onUnlock }) {
+  const [pin, setPin] = useState("");
+  const [error, setError] = useState("");
+  const [shake, setShake] = useState(false);
+
+  const digit = (d) => {
+    if (error) setError("");
+    const next = (pin + d).slice(0, 4);
+    setPin(next);
+    if (next.length === 4) {
+      setTimeout(async () => {
+        const hash = await sha256Hex(next);
+        if (hash === expected) onUnlock();
+        else { setError("Wrong PIN"); setPin(""); setShake(true); setTimeout(() => setShake(false), 400); }
+      }, 100);
+    }
+  };
+  const backspace = () => setPin((p) => p.slice(0, -1));
+
+  return <PinPad title="Unlock your ledger" subtitle="Enter your PIN." value={pin} onDigit={digit} onBackspace={backspace} error={error} shake={shake} />;
 }
 
 /* ------------------------------- Nav ------------------------------- */
@@ -481,7 +516,7 @@ function Nav({ tab, setTab }) {
 }
 
 /* ------------------------------- Hero ------------------------------ */
-function Hero({ profile, d, lastAI, clearAI, onEdit, onReset, onSignOut, aiStatus }) {
+function Hero({ profile, d, lastAI, clearAI, onEdit, onReset, onLock, onChangePin, aiStatus }) {
   const { forecast, potential, attrs, gold, rank, deeds, streak, savingsRate, quests } = d;
   const [menu, setMenu] = useState(false);
   const lifeProgress = clamp(profile.age / forecast.estLifespan, 0, 1);
@@ -515,7 +550,8 @@ function Hero({ profile, d, lastAI, clearAI, onEdit, onReset, onSignOut, aiStatu
       {menu && (
         <div style={S.menu}>
           <button className="menuItem" style={S.menuItem} onClick={() => { setMenu(false); onEdit(); }}>Edit hero</button>
-          <button className="menuItem" style={S.menuItem} onClick={() => { setMenu(false); onSignOut(); }}>Sign out</button>
+          <button className="menuItem" style={S.menuItem} onClick={() => { setMenu(false); onLock(); }}>Lock</button>
+          <button className="menuItem" style={S.menuItem} onClick={() => { setMenu(false); onChangePin(); }}>Change PIN</button>
           <button className="menuItem" style={{ ...S.menuItem, color: C.ember }} onClick={() => { setMenu(false); onReset(); }}>Start new game</button>
         </div>
       )}
@@ -860,6 +896,12 @@ const S = {
   del: { background: "none", border: "none", color: C.dim, cursor: "pointer", fontSize: 13, padding: 4 },
 
   oracleErr: { marginTop: 14, padding: 12, borderRadius: 10, border: `1px solid ${C.ember}`, color: C.parch, fontSize: 12.5, background: "rgba(188,77,46,.1)" },
+
+  pinDots: { display: "flex", justifyContent: "center", gap: 16, margin: "28px 0" },
+  pinDot: { width: 16, height: 16, borderRadius: "50%", border: `1px solid ${C.gold}`, transition: "background .15s" },
+  pinError: { textAlign: "center", color: C.ember, fontSize: 12.5, marginBottom: 12 },
+  pinGrid: { display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 14, maxWidth: 260, margin: "0 auto" },
+  pinKey: { aspectRatio: "1", borderRadius: "50%", border: `1px solid ${C.line}`, background: C.ink2, color: C.parch, fontSize: 22, fontFamily: "'Cinzel', serif", cursor: "pointer" },
   scrollCard: { marginTop: 16, background: `linear-gradient(160deg, ${C.parch}, #DCCDA8)`, color: "#2A2114", borderRadius: 14, padding: 18, border: `1px solid ${C.gold}`, boxShadow: "0 10px 30px rgba(0,0,0,.45)" },
   sealRow: { display: "flex", alignItems: "center", gap: 10, marginBottom: 10 },
   seal: { width: 30, height: 30, borderRadius: "50%", background: C.ember, color: C.goldHi, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 15, flexShrink: 0, boxShadow: "0 2px 6px rgba(0,0,0,.3)" },
@@ -912,6 +954,9 @@ const CSS = `
 .gear:hover, .del:hover { color: ${C.gold}; }
 .menuItem:hover { background: rgba(200,169,110,.1); }
 .navbtn:active { transform: scale(.94); }
+.pinkey:hover { background: rgba(200,169,110,.12); }
+.pinkey:active { transform: scale(.94); }
 ::-webkit-scrollbar { width: 0; }
+@keyframes pinshake { 0%, 100% { transform: translateX(0); } 25% { transform: translateX(-8px); } 75% { transform: translateX(8px); } }
 @media (prefers-reduced-motion: reduce) { * { transition: none !important; animation: none !important; } }
 `;
