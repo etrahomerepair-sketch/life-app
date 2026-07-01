@@ -48,24 +48,30 @@ const MEAL_OPTS = [["healthy", "Healthy"], ["mixed", "Mixed"], ["junk", "Junk"],
 const MIMO_SYSTEM_PROMPT =
 `You are the LEDGER SCRIBE for an app called Life Ledger — a real-life tracker styled as an RPG.
 You receive a player's profile (background/class, physical stats, self-reported vices, and their
-own stated short-term and long-term goals) and ONE new journal entry: structured fields plus a
-free-text note. This is a real person trying to actually improve their real life — take the job
-seriously. Read carefully and act like an active coach who's paying attention across entries and
-who remembers what this specific person is trying to achieve, not a form validator.
+own stated short-term and long-term goals) and their CURRENT state for today: structured fields
+(workouts, drinks, sleep, meals, mood, money) plus an optional free-text note. You are called after
+EVERY logged change, including quick one-tap logs with no note attached — not just journal entries.
+This is a real person trying to actually improve their real life — take the job seriously. Read
+carefully and act like an active coach who's paying attention across the whole day, not a form
+validator, and who remembers what this specific person is trying to achieve.
 
 YOUR JOB
 1. Turn messy input into clean structured data the app's deterministic engine can use.
-2. Read the free-text note and EXTRACT anything notable not already in the fields
-   (money won/lost gambling, junk food, skipped workouts, illness, overtime, big purchases, use of
-   any vice they listed, etc).
-3. Propose ONE new quest when it's warranted — tailored to what the player actually wrote AND to
-   their stated goals/vices when relevant, not a generic template. Prefer inventing something
-   specific and a little evocative over skipping it, especially if the note reveals a real struggle
-   or moves them toward (or away from) a goal they told you about.
+2. If there's a free-text note, EXTRACT anything notable not already in the fields (money won/lost
+   gambling, junk food, skipped workouts, illness, overtime, big purchases, use of any vice they
+   listed, etc). If the note is empty, there's nothing to extract — just review the structured
+   fields as they stand today.
+3. Propose ONE new quest when it's warranted — tailored to the player's actual data (and note, when
+   present) AND to their stated goals/vices when relevant, not a generic template. Prefer inventing
+   something specific and a little evocative over skipping it, especially when the day's pattern
+   reveals a real struggle or moves them toward (or away from) a goal they told you about. It's fine
+   to return null most of the time — only mint when something genuinely warrants it.
 
 RULES
 - Never invent facts the entry doesn't support. If a field isn't implied, return null for it.
 - Only fill a structured field if the note implies a value the form missed. Don't overwrite given values.
+- If there's no note, "summary" and "insight" should briefly reflect today's logged state so far
+  (e.g. progress toward a goal, a pattern worth naming) — keep it short, don't pad with filler.
 - Money: "earned"/"spent" are normal income/expenses. Gambling is SEPARATE — put it in "gambling".
 - No medical diagnosis. Keep any guidance gentle, specific, non-extreme, encouraging — but don't be
   vague or generic either. Reference the actual thing they wrote.
@@ -411,43 +417,102 @@ export default function App() {
     setDynQuests(n); storeSet(KEY_Q, n);
   };
 
-  // The AI-on-every-entry pipeline.
-  const addEntry = async (form) => {
-    const diet = dietFromMeals(form.meals);
-    let en = { ...form, id: Date.now(), diet, gambleWon: 0, gambleLost: 0, tags: [], ai: { ok: false } };
+  const todayStr = () => new Date().toISOString().slice(0, 10);
+  const todayEntry = entries.find((e) => e.date === todayStr() && e.period === "day") || null;
+  const blankToday = () => ({ id: Date.now(), date: todayStr(), period: "day", workouts: 0, drinks: 0, sleep: 0, meals: {}, diet: 0, mood: 0, earned: 0, spent: 0, gambleWon: 0, gambleLost: 0, tags: [], ai: { ok: false }, notes: "" });
+
+  // Refs mirroring the latest state so the debounced Scribe call below always
+  // reads fresh data, even though it fires ~1s after the render that queued it.
+  const entriesRef = useRef(entries);
+  useEffect(() => { entriesRef.current = entries; }, [entries]);
+  const dynQuestsRef = useRef(dynQuests);
+  useEffect(() => { dynQuestsRef.current = dynQuests; }, [dynQuests]);
+
+  // Every logged change — quick tap or journal note — goes through the Scribe,
+  // so it can track habits, keep the extracted stats accurate, and mint quests
+  // off anything you do, not just what you write. Reads today's entry as a
+  // snapshot to build the request, but merges the result back via functional
+  // state updates, since another tap can land while this call is in flight.
+  const runScribe = async (note, { navigateToHero }) => {
+    const date = todayStr();
+    const snapshot = entriesRef.current.find((e) => e.date === date && e.period === "day") || blankToday();
     const ctx = {
-      recentTags: Array.from(new Set(entries.slice(0, 6).flatMap((e) => e.tags || []))),
-      activeQuestTitles: dynQuests.map((q) => q.title),
+      recentTags: Array.from(new Set(entriesRef.current.slice(0, 6).flatMap((e) => e.tags || []))),
+      activeQuestTitles: dynQuestsRef.current.map((q) => q.title),
     };
+    let result = null, aiOffline = null;
     try {
-      const r = await processEntry(profile, { date: en.date, period: en.period, workouts: en.workouts, drinks: en.drinks, sleep: en.sleep, meals: en.meals, dietScore: diet, mood: en.mood, earned: num(en.earned), spent: num(en.spent), note: en.notes }, ctx);
-      const ex = r.extracted || {};
-      // Only fill where the form was empty/zero; always take gambling + tags + refined diet.
-      en.workouts = en.workouts || num(ex.workouts) || 0;
-      en.drinks = en.drinks || num(ex.drinks) || 0;
-      if (num(ex.sleep)) en.sleep = num(ex.sleep);
-      if (num(ex.mood)) en.mood = num(ex.mood);
-      if (num(ex.dietScore)) en.diet = num(ex.dietScore);
-      if (num(ex.earned)) en.earned = num(ex.earned);
-      if (num(ex.spent)) en.spent = num(ex.spent);
-      en.gambleWon = num(ex.gambling?.won) || 0;
-      en.gambleLost = num(ex.gambling?.lost) || 0;
-      en.tags = Array.isArray(r.tags) ? r.tags : [];
-      en.ai = { ok: true, summary: r.summary, insight: r.insight };
-      // dynamic quest minting (dedupe by title, only allowed metrics)
-      const nq = r.newQuest;
-      if (nq && nq.title && CONFIG.questMetrics.includes(nq.metric) && !dynQuests.some((q) => q.title.toLowerCase() === nq.title.toLowerCase())) {
-        const next = [{ ...nq, id: "ai_" + Date.now(), createdAt: en.date, done: false }, ...dynQuests];
-        setDynQuests(next); storeSet(KEY_Q, next);
-      }
+      result = await processEntry(profile, { date: snapshot.date, period: snapshot.period, workouts: snapshot.workouts, drinks: snapshot.drinks, sleep: snapshot.sleep, meals: snapshot.meals, dietScore: snapshot.diet, mood: snapshot.mood, earned: num(snapshot.earned), spent: num(snapshot.spent), note: note || "" }, ctx);
     } catch (err) {
-      en.ai = { ok: false, summary: "Saved without AI — " + (err && err.message ? err.message : "offline"), insight: "" };
+      aiOffline = { ok: false, summary: (note ? "Saved without AI — " : "Scribe offline — ") + (err && err.message ? err.message : "offline"), insight: "" };
     }
-    const next = [en, ...entries].sort((a, b) => new Date(b.date) - new Date(a.date));
-    setEntries(next); storeSet(KEY_E, next);
-    setLastAI(en.ai); setTab("hero");
-    return en.ai;
+
+    let finalAi = aiOffline;
+    setEntries((prev) => {
+      const existing = prev.find((e) => e.date === date && e.period === "day");
+      let en = existing ? { ...existing } : blankToday();
+      if (note) en.notes = [en.notes, note].filter(Boolean).join(" · ");
+      if (result) {
+        const ex = result.extracted || {};
+        en.workouts = en.workouts || num(ex.workouts) || 0;
+        en.drinks = en.drinks || num(ex.drinks) || 0;
+        if (num(ex.sleep)) en.sleep = num(ex.sleep);
+        if (num(ex.mood)) en.mood = num(ex.mood);
+        if (num(ex.dietScore)) en.diet = num(ex.dietScore);
+        if (num(ex.earned)) en.earned = (Number(en.earned) || 0) + num(ex.earned);
+        if (num(ex.spent)) en.spent = (Number(en.spent) || 0) + num(ex.spent);
+        en.gambleWon = (Number(en.gambleWon) || 0) + (num(ex.gambling?.won) || 0);
+        en.gambleLost = (Number(en.gambleLost) || 0) + (num(ex.gambling?.lost) || 0);
+        en.tags = Array.from(new Set([...(en.tags || []), ...(Array.isArray(result.tags) ? result.tags : [])]));
+        en.ai = { ok: true, summary: result.summary, insight: result.insight };
+      } else {
+        en.ai = aiOffline;
+      }
+      finalAi = en.ai;
+      const next = existing ? prev.map((e) => (e.id === en.id ? en : e)) : [en, ...prev].sort((a, b) => new Date(b.date) - new Date(a.date));
+      storeSet(KEY_E, next);
+      return next;
+    });
+
+    // dynamic quest minting (dedupe by title, only allowed metrics)
+    const nq = result?.newQuest;
+    if (nq && nq.title && CONFIG.questMetrics.includes(nq.metric)) {
+      setDynQuests((prev) => {
+        if (prev.some((q) => q.title.toLowerCase() === nq.title.toLowerCase())) return prev;
+        const next = [{ ...nq, id: "ai_" + Date.now(), createdAt: date, done: false }, ...prev];
+        storeSet(KEY_Q, next);
+        return next;
+      });
+    }
+
+    setLastAI(finalAi);
+    if (navigateToHero) setTab("hero");
+    return finalAi;
   };
+
+  // Instant local update so quick taps feel immediate, then a debounced
+  // Scribe call on the settled state — a burst of taps (e.g. nudging a
+  // stepper) becomes one AI call once you pause, not one per click, but
+  // every logged change still reaches the AI within about a second.
+  const quickScribeTimer = useRef(null);
+  useEffect(() => () => clearTimeout(quickScribeTimer.current), []);
+  const quickUpdate = (patch) => {
+    const date = todayStr();
+    setEntries((prev) => {
+      const existing = prev.find((e) => e.date === date && e.period === "day");
+      const base = existing || blankToday();
+      const updated = { ...base, ...patch };
+      if (patch.meals) updated.meals = { ...(base.meals || {}), ...patch.meals };
+      if (updated.meals && Object.keys(updated.meals).length) updated.diet = dietFromMeals(updated.meals);
+      const next = existing ? prev.map((e) => (e.id === existing.id ? updated : e)) : [updated, ...prev].sort((a, b) => new Date(b.date) - new Date(a.date));
+      storeSet(KEY_E, next);
+      return next;
+    });
+    clearTimeout(quickScribeTimer.current);
+    quickScribeTimer.current = setTimeout(() => { runScribe(null, { navigateToHero: false }); }, 1200);
+  };
+
+  const submitJournal = (note) => runScribe(note, { navigateToHero: true });
 
   const d = useMemo(() => {
     if (!profile) return null;
@@ -478,7 +543,7 @@ export default function App() {
             : loading ? <div style={S.loading}>Unrolling the ledger…</div>
             : !profile || editing ? <Onboard initial={profile} onSave={saveProfile} onCancel={profile ? () => setEditing(false) : null} />
             : tab === "hero" ? <Hero profile={profile} d={d} lastAI={lastAI} clearAI={() => setLastAI(null)} onEdit={() => setEditing(true)} onReset={resetAll} onLock={lock} onChangePin={changePin} onCompleteQuest={completeQuest} aiStatus={aiStatus} />
-            : tab === "log" ? <LogEntry onAdd={addEntry} />
+            : tab === "log" ? <QuickLog today={todayEntry} profile={profile} onQuickUpdate={quickUpdate} onJournal={submitJournal} lastAI={lastAI} clearAI={() => setLastAI(null)} />
             : tab === "chronicle" ? <Chronicle entries={entries} d={d} onDelete={deleteEntry} />
             : <Oracle profile={profile} entries={entries} d={d} cached={oracle} onResult={saveOracle} activeQuestTitles={dynQuests.map((q) => q.title)} onAdopt={adoptQuest} />}
         </div>
@@ -1075,52 +1140,153 @@ function EditHero({ initial, onSave, onCancel }) {
 }
 
 /* ------------------------------ Log -------------------------------- */
-function LogEntry({ onAdd }) {
-  const today = new Date().toISOString().slice(0, 10);
-  const [e, setE] = useState({ date: today, period: "week", workouts: 0, drinks: 0, sleep: 7, meals: { breakfast: "mixed", lunch: "mixed", dinner: "mixed" }, mood: 3, earned: 0, spent: 0, notes: "" });
+// Quick, one-tap logging for today, plus an optional free-text journal.
+// Each quick action saves instantly (no AI round trip needed — there's no
+// free text to interpret). The journal at the bottom is the only thing
+// that calls the Scribe, and it's entirely optional.
+function QuickLog({ today, profile, onQuickUpdate, onJournal, lastAI, clearAI }) {
+  const t = today || {};
+  const [flashKey, setFlashKey] = useState(null);
+  const flashTimer = useRef(null);
+  const flash = (key) => {
+    setFlashKey(key);
+    clearTimeout(flashTimer.current);
+    flashTimer.current = setTimeout(() => setFlashKey(null), 1100);
+  };
+  useEffect(() => () => clearTimeout(flashTimer.current), []);
+
+  const setMeal = (meal, val) => { onQuickUpdate({ meals: { [meal]: val } }); flash(meal); };
+  const setSleep = (v) => { onQuickUpdate({ sleep: v }); flash("sleep"); };
+  const setWorkouts = (v) => { onQuickUpdate({ workouts: v }); flash("workouts"); };
+  const setDrinks = (v) => { onQuickUpdate({ drinks: v }); flash("drinks"); };
+  const setMood = (v) => { onQuickUpdate({ mood: v }); flash("mood"); };
+
+  const [moneyAmt, setMoneyAmt] = useState("");
+  const [moneyType, setMoneyType] = useState("spent");
+  const logMoney = () => {
+    const amt = Number(moneyAmt) || 0;
+    if (!amt) return;
+    onQuickUpdate({ [moneyType]: (Number(t[moneyType]) || 0) + amt });
+    setMoneyAmt(""); flash("money");
+  };
+
+  const trackGambling = (profile.vices || []).includes("Gambling");
+  const [gambleAmt, setGambleAmt] = useState("");
+  const [gambleType, setGambleType] = useState("lost");
+  const logGamble = () => {
+    const amt = Number(gambleAmt) || 0;
+    if (!amt) return;
+    const key = gambleType === "lost" ? "gambleLost" : "gambleWon";
+    onQuickUpdate({ [key]: (Number(t[key]) || 0) + amt });
+    setGambleAmt(""); flash("gamble");
+  };
+
+  const [note, setNote] = useState("");
   const [busy, setBusy] = useState(false);
-  const set = (k, v) => setE((s) => ({ ...s, [k]: v }));
-  const setMeal = (m, v) => setE((s) => ({ ...s, meals: { ...s.meals, [m]: v } }));
-  const submit = async () => { setBusy(true); await onAdd(e); setBusy(false); };
+  const submitNote = async () => {
+    if (!note.trim()) return;
+    setBusy(true);
+    await onJournal(note.trim());
+    setNote(""); setBusy(false);
+  };
+
   return (
     <div style={S.pad}>
-      <div style={S.kicker}>{e.period === "day" ? "Today" : "This week"}</div>
-      <h1 style={S.name}>Log a deed</h1>
-      <div style={S.two}>
-        <Field label="Date"><input className="inp" style={S.input} type="date" value={e.date} onChange={(ev) => set("date", ev.target.value)} /></Field>
-        <Field label="Covers"><select className="inp" style={S.input} value={e.period} onChange={(ev) => set("period", ev.target.value)}><option value="day">A day</option><option value="week">A week</option></select></Field>
-      </div>
-      <div style={S.two}>
-        <Stepper label={`Workouts (${e.period})`} value={e.workouts} onChange={(v) => set("workouts", v)} max={21} />
-        <Stepper label={`Drinks (${e.period})`} value={e.drinks} onChange={(v) => set("drinks", v)} max={60} />
-      </div>
-      <Slider label="Avg sleep / night" value={e.sleep} min={3} max={12} step={0.5} suffix="h" onChange={(v) => set("sleep", v)} />
+      {lastAI && (
+        <div style={S.toast} onClick={clearAI}>
+          <span style={{ color: lastAI.ok ? C.sage : C.ember }}>{lastAI.ok ? "✶ Scribe is watching" : "⚠ Scribe offline"}</span>
+          {lastAI.summary ? <span style={S.toastSub}>{lastAI.summary}</span> : null}
+        </div>
+      )}
+      <div style={S.kicker}>Today</div>
+      <h1 style={S.name}>Quick log</h1>
+      <p style={S.dim}>Tap things as they happen — no need to fill it all out at once.</p>
 
-      <div style={S.fieldLabel}>Meals</div>
-      <div style={S.meals}>
+      <QuickCard title="Meals" saved={["breakfast", "lunch", "dinner"].includes(flashKey)}>
         {["breakfast", "lunch", "dinner"].map((m) => (
           <div key={m} style={S.mealRow}>
             <span style={S.mealName}>{m[0].toUpperCase() + m.slice(1)}</span>
             <div style={S.segwrap}>
               {MEAL_OPTS.map(([val, lbl]) => (
-                <button key={val} className="seg" onClick={() => setMeal(m, val)} style={{ ...S.seg, ...(e.meals[m] === val ? S.segOn : {}) }}>{lbl}</button>
+                <button key={val} className="seg" onClick={() => setMeal(m, val)} style={{ ...S.seg, ...((t.meals || {})[m] === val ? S.segOn : {}) }}>{lbl}</button>
               ))}
             </div>
           </div>
         ))}
+      </QuickCard>
+
+      <QuickCard title="Sleep last night" saved={flashKey === "sleep"}>
+        <Slider label="Hours" value={t.sleep || 7} min={3} max={12} step={0.5} suffix="h" onChange={setSleep} />
+      </QuickCard>
+
+      <QuickCard title="Mood right now" saved={flashKey === "mood"}>
+        <MoodPicker value={t.mood} onChange={setMood} />
+      </QuickCard>
+
+      <div style={S.two}>
+        <QuickCard title="Workouts" saved={flashKey === "workouts"} compact>
+          <Stepper label="Today" value={t.workouts || 0} onChange={setWorkouts} max={10} />
+        </QuickCard>
+        <QuickCard title="Drinks" saved={flashKey === "drinks"} compact>
+          <Stepper label="Today" value={t.drinks || 0} onChange={setDrinks} max={30} />
+        </QuickCard>
       </div>
 
-      <Slider label="Mood / spirit" value={e.mood} min={1} max={5} step={1} onChange={(v) => set("mood", v)} />
-      <div style={S.two}>
-        <Field label="Earned ($)"><input className="inp" style={S.input} type="number" value={e.earned} onChange={(ev) => set("earned", ev.target.value)} /></Field>
-        <Field label="Spent ($)"><input className="inp" style={S.input} type="number" value={e.spent} onChange={(ev) => set("spent", ev.target.value)} /></Field>
+      <QuickCard title="Money" saved={flashKey === "money"}>
+        <div style={S.segwrap}>
+          <button className="seg" onClick={() => setMoneyType("earned")} style={{ ...S.seg, ...(moneyType === "earned" ? S.segOn : {}) }}>Earned</button>
+          <button className="seg" onClick={() => setMoneyType("spent")} style={{ ...S.seg, ...(moneyType === "spent" ? S.segOn : {}) }}>Spent</button>
+        </div>
+        <div style={S.quickAddRow}>
+          <input className="inp" style={S.input} type="number" placeholder="$0" value={moneyAmt} onChange={(e) => setMoneyAmt(e.target.value)} />
+          <button className="btn-ghost" style={S.quickAddBtn} onClick={logMoney}>Log</button>
+        </div>
+        <div style={S.quickTotal}>Today: {fmtMoney(t.earned || 0)} earned · {fmtMoney(t.spent || 0)} spent</div>
+      </QuickCard>
+
+      {trackGambling && (
+        <QuickCard title="Gambling" saved={flashKey === "gamble"}>
+          <div style={S.segwrap}>
+            <button className="seg" onClick={() => setGambleType("won")} style={{ ...S.seg, ...(gambleType === "won" ? S.segOn : {}) }}>Won</button>
+            <button className="seg" onClick={() => setGambleType("lost")} style={{ ...S.seg, ...(gambleType === "lost" ? S.segOn : {}) }}>Lost</button>
+          </div>
+          <div style={S.quickAddRow}>
+            <input className="inp" style={S.input} type="number" placeholder="$0" value={gambleAmt} onChange={(e) => setGambleAmt(e.target.value)} />
+            <button className="btn-ghost" style={S.quickAddBtn} onClick={logGamble}>Log</button>
+          </div>
+        </QuickCard>
+      )}
+
+      <Section title="Journal (optional)">
+        <p style={S.dim}>Write anything — the Scribe reads it, fills in gaps, and might hand you a quest.</p>
+        <textarea className="inp" style={{ ...S.input, minHeight: 90, resize: "vertical" }} value={note} placeholder="e.g. gambled and lost $500 · felt sick today · pulled an all-nighter" onChange={(e) => setNote(e.target.value)} />
+        <button className="btn-primary" style={{ ...S.btnPrimary, width: "100%", marginTop: 10, opacity: busy || !note.trim() ? 0.6 : 1 }} disabled={busy || !note.trim()} onClick={submitNote}>
+          {busy ? "Scribe is reading…" : "Write it down"}
+        </button>
+      </Section>
+    </div>
+  );
+}
+
+function QuickCard({ title, children, saved, compact }) {
+  return (
+    <div style={{ ...S.quickCard, ...(compact ? S.quickCardCompact : {}) }}>
+      <div style={S.quickCardHead}>
+        <span style={S.quickCardTitle}>{title}</span>
+        {saved && <span style={S.quickSaved}>✓ saved</span>}
       </div>
-      <Field label="Anything else? (the AI reads this)">
-        <textarea className="inp" style={{ ...S.input, minHeight: 76, resize: "vertical" }} value={e.notes} placeholder="e.g. gambled and lost $500 · ate clean all week · pulled two all-nighters" onChange={(ev) => set("notes", ev.target.value)} />
-      </Field>
-      <button className="btn-primary" style={{ ...S.btnPrimary, width: "100%", marginTop: 6, opacity: busy ? 0.7 : 1 }} disabled={busy} onClick={submit}>
-        {busy ? "Scribe is reading…" : "Record it"}
-      </button>
+      {children}
+    </div>
+  );
+}
+
+function MoodPicker({ value, onChange }) {
+  const faces = [["1", "😞"], ["2", "🙁"], ["3", "😐"], ["4", "🙂"], ["5", "😄"]];
+  return (
+    <div style={S.moodRow}>
+      {faces.map(([v, emoji]) => (
+        <button key={v} className="moodbtn" style={{ ...S.moodBtn, ...(Number(value) === Number(v) ? S.moodBtnOn : {}) }} onClick={() => onChange(Number(v))}>{emoji}</button>
+      ))}
     </div>
   );
 }
@@ -1366,6 +1532,18 @@ const S = {
   seg: { flex: 1, padding: "7px 0", fontSize: 11, borderRadius: 7, border: `1px solid ${C.line}`, background: C.ink2, color: C.dim, cursor: "pointer", fontFamily: "'Inter',sans-serif" },
   segOn: { background: C.gold, color: C.ink, borderColor: C.gold, fontWeight: 700 },
 
+  quickCard: { background: C.card, border: `1px solid ${C.line}`, borderRadius: 12, padding: 14, marginBottom: 12, flex: 1 },
+  quickCardCompact: { padding: "12px 14px" },
+  quickCardHead: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 },
+  quickCardTitle: { fontFamily: "'Cinzel', serif", fontSize: 12.5, letterSpacing: 1, textTransform: "uppercase", color: C.gold },
+  quickSaved: { fontSize: 10.5, color: C.sage, fontWeight: 600 },
+  quickAddRow: { display: "flex", gap: 8, marginTop: 10 },
+  quickAddBtn: { padding: "0 16px", fontSize: 12 },
+  quickTotal: { fontSize: 11, color: C.dim, marginTop: 8 },
+  moodRow: { display: "flex", justifyContent: "space-between", gap: 6 },
+  moodBtn: { flex: 1, fontSize: 24, padding: "8px 0", borderRadius: 10, border: `1px solid ${C.line}`, background: C.ink2, cursor: "pointer" },
+  moodBtnOn: { borderColor: C.gold, background: "rgba(200,169,110,.15)" },
+
   btnPrimary: { background: `linear-gradient(135deg, ${C.ember}, #8E3A22)`, color: C.parch, border: `1px solid ${C.gold}`, padding: "13px 16px", borderRadius: 10, fontFamily: "'Cinzel', serif", fontSize: 13, letterSpacing: 1, cursor: "pointer", fontWeight: 600, boxShadow: "inset 0 1px 0 rgba(255,255,255,.15), 0 3px 8px rgba(0,0,0,.35)" },
   btnGhost: { background: "transparent", color: C.parch, border: `1px solid ${C.line}`, padding: "13px 16px", borderRadius: 10, fontFamily: "'Cinzel', serif", fontSize: 12, letterSpacing: 1, cursor: "pointer" },
 
@@ -1389,6 +1567,8 @@ const CSS = `
 .pinkey:hover { background: rgba(200,169,110,.12); }
 .pinkey:active { transform: scale(.94); }
 .bgcard:hover { border-color: ${C.gold}; }
+.moodbtn:hover { border-color: ${C.gold}; }
+.moodbtn:active { transform: scale(.92); }
 ::-webkit-scrollbar { width: 0; }
 @keyframes pinshake { 0%, 100% { transform: translateX(0); } 25% { transform: translateX(-8px); } 75% { transform: translateX(8px); } }
 @media (prefers-reduced-motion: reduce) { * { transition: none !important; animation: none !important; } }
